@@ -21,6 +21,22 @@ class PlannerParameters(BaseModel):
     max_results: int = Field(default=8, ge=1, le=20)
 
 
+class FieldGuideParameters(BaseModel):
+    genuses: list[str] = Field(description="Biological genera shown by the Detailed Surface Scanner filters")
+
+
+FIELD_GUIDE = {
+    "stratum": {"priority": 1, "terrain": "flat, open plains; avoid broken ground", "appearance": "broad layered mats or low plate-like colonies", "method": "Use the DSS Stratum filter; fly low over the brightest solid-colour patches, land with long clear sight-lines."},
+    "clypeus": {"priority": 2, "terrain": "rocky slopes and rough highlands, not flat plains", "appearance": "large upright fan/shell structures", "method": "Use the Clypeus filter; search illuminated rocky slopes from the ship or SRV."},
+    "tussock": {"priority": 5, "terrain": "open plains and gentle slopes", "appearance": "small grass-like clumps", "method": "Use the Tussock filter; low-altitude visual search or SRV because individual clumps are small."},
+    "frutexa": {"priority": 4, "terrain": "rocky ground, slopes and foothills", "appearance": "bushy branching shrubs", "method": "Use the Frutexa filter; scan rough foothills rather than smooth plains."},
+    "osseus": {"priority": 3, "terrain": "rocky and mountainous ground", "appearance": "pale branching bone/coral-like growths", "method": "Use the Osseus filter; search rock fields and mountain bases."},
+    "fungoida": {"priority": 6, "terrain": "mountainous, rocky terrain and crater slopes", "appearance": "mushroom-like caps or stalked colonies", "method": "Use the Fungoida filter; search rugged slopes, accepting slower travel only after higher-value genera."},
+    "cactoida": {"priority": 7, "terrain": "rocky plains and slopes", "appearance": "upright cactus-like columns or clusters", "method": "Use the Cactoida filter and fly low across moderately rough ground."},
+    "bacterium": {"priority": 8, "terrain": "flat ground matching its colour; often low contrast", "appearance": "thin discoloured surface patches", "method": "Lowest priority here. Use the DSS Bacterium filter, then camera/NV contrast and low-angle light; skip if search time damages credits/hour."},
+}
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -139,25 +155,58 @@ def _plan(parameters: PlannerParameters, context: dict[str, Any]) -> str:
     }, ensure_ascii=False)
 
 
+def _field_guide(parameters: FieldGuideParameters, _context: dict[str, Any]) -> str:
+    selected = []
+    for raw_name in parameters.genuses:
+        key = raw_name.strip().casefold().replace("$codex_ent_", "").replace("_genus_name;", "")
+        key = {"fungoids": "fungoida", "cactoids": "cactoida", "bacterial": "bacterium", "shrubs": "frutexa", "tussocks": "tussock"}.get(key, key)
+        guide = FIELD_GUIDE.get(key)
+        if guide:
+            selected.append({"genus": key.title(), **guide})
+    selected.sort(key=lambda item: item["priority"])
+    return json.dumps({
+        "sampling_order": selected,
+        "immediate_instruction": (
+            f"Select the {selected[0]['genus']} DSS filter and search {selected[0]['terrain']}. {selected[0]['method']}"
+            if selected else "Read the genus names from the DSS filter list and call this tool again."
+        ),
+        "sampling_rule": "Collect three genetically diverse samples of the selected species before switching species; the required separation is species-specific and the sampler indicates validity.",
+        "warning": "DSS colours show probable surface regions, not exact organism positions. Do not claim coordinates unless a tool supplied them.",
+    }, ensure_ascii=False)
+
+
 class ExobiologyProfitPlannerPlugin(PluginBase):
     def __init__(self, plugin_manifest: PluginManifest):
         super().__init__(plugin_manifest)
 
     def on_chat_start(self, helper: PluginHelper):
-        if "find_exobiology_targets" in helper._action_manager.actions:
-            return
-        helper.register_action(
-            name="find_exobiology_targets",
-            description=(
-                "Find and rank currently known exobiology targets near the commander's live system for maximum credits per hour. "
-                "Use immediately for exobiology money-making requests. After receiving a result, call plotToTarget with the "
-                "recommended navigation system without asking for confirmation. Do not perform preliminary web searches or status checks."
-            ),
-            parameters=PlannerParameters,
-            method=_plan,
-            action_type="web",
-            input_template=lambda args, _context: "Optimizing an exobiology route from the current system",
-        )
+        if "find_exobiology_targets" not in helper._action_manager.actions:
+            helper.register_action(
+                name="find_exobiology_targets",
+                description=(
+                    "Find and rank a NEW destination planet near the commander's live system for maximum exobiology credits per hour. "
+                    "Use only when asked to find, replace, or optimize a destination. Never use while the commander is asking how to "
+                    "locate or sample organisms on the current planet. After receiving a result, call plotToTarget with the "
+                    "recommended navigation system without asking for confirmation. Do not perform preliminary web searches or status checks."
+                ),
+                parameters=PlannerParameters,
+                method=_plan,
+                action_type="web",
+                input_template=lambda args, _context: "Optimizing an exobiology route from the current system",
+            )
+        if "get_exobiology_field_guide" not in helper._action_manager.actions:
+            helper.register_action(
+                name="get_exobiology_field_guide",
+                description=(
+                    "Give concrete terrain, visual appearance, DSS-filter workflow, and profit-priority guidance for biological genera "
+                    "already shown on the commander's current planet. Use when asked what to look for, where to land, or how to find a genus. "
+                    "Do not search for another planet and do not invent exact coordinates."
+                ),
+                parameters=FieldGuideParameters,
+                method=_field_guide,
+                action_type="web",
+                input_template=lambda args, _context: "Preparing an on-planet exobiology search order",
+            )
 
     def on_chat_stop(self, helper: PluginHelper):
         pass
