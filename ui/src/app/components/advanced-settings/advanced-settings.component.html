@@ -743,6 +743,8 @@
                 <mat-option value="openai">OpenAI</mat-option>
                 <mat-option value="edge-tts">Edge TTS</mat-option>
                 <mat-option value="local-ai-server">Local AIServer</mat-option>
+                <mat-option value="chatterbox-local">Chatterbox (Local OpenAI API)</mat-option>
+                <mat-option value="qwen3-tts-local">Qwen3-TTS (Local OpenAI API)</mat-option>
                 <mat-option value="custom">Custom</mat-option>
                 <mat-option value="none">None</mat-option>
                 @if (pluginTTSProviders.length > 0) {
@@ -870,6 +872,66 @@
                     <mat-icon>{{ hideTtsApiKey ? 'visibility_off' : 'visibility' }}</mat-icon>
                 </button>
             </mat-form-field>
+            <mat-form-field>
+                <mat-label>Voice Tone Instructions</mat-label>
+                <textarea matInput [ngModel]="character?.tts_prompt || ''"
+                          (ngModelChange)="updateTTSPrompt($event)"
+                          rows="3"></textarea>
+                <mat-hint>Sent as the OpenAI-compatible instructions field when supported by the server.</mat-hint>
+            </mat-form-field>
+        }
+        @if (config.tts_provider === "chatterbox-local") {
+            <mat-form-field>
+                <mat-label>Chatterbox Endpoint</mat-label>
+                <input matInput [(ngModel)]="config.tts_chatterbox_endpoint"
+                       (ngModelChange)="onConfigChange({tts_chatterbox_endpoint: $event})">
+            </mat-form-field>
+        }
+        @if (config.tts_provider === "qwen3-tts-local") {
+            <mat-form-field>
+                <mat-label>Qwen3-TTS Endpoint</mat-label>
+                <input matInput [(ngModel)]="config.tts_qwen3_endpoint"
+                       (ngModelChange)="onConfigChange({tts_qwen3_endpoint: $event})">
+            </mat-form-field>
+        }
+        @if (config.tts_provider === "chatterbox-local" || config.tts_provider === "qwen3-tts-local") {
+            <mat-form-field>
+                <mat-label>Speech Language</mat-label>
+                <mat-select [(ngModel)]="config.tts_language"
+                            (ngModelChange)="onSpeechLanguageChange($event)">
+                    <mat-option value="en">English</mat-option>
+                    <mat-option value="fr">French</mat-option>
+                </mat-select>
+                <mat-hint>Also updates STT language so listening and speech stay aligned.</mat-hint>
+            </mat-form-field>
+            <mat-form-field>
+                <mat-label>TTS Voice</mat-label>
+                <input matInput [ngModel]="character?.tts_voice || 'nova'"
+                       (ngModelChange)="updateTTSVoice($event)">
+            </mat-form-field>
+            <mat-form-field>
+                <mat-label>TTS Speed</mat-label>
+                <input matInput [ngModel]="character?.tts_speed || '1.2'"
+                       (ngModelChange)="updateTTSSpeed($event)">
+            </mat-form-field>
+            <mat-form-field>
+                <mat-label>Voice Tone Instructions</mat-label>
+                <textarea matInput [ngModel]="character?.tts_prompt || ''"
+                          (ngModelChange)="updateTTSPrompt($event)"
+                          rows="3"></textarea>
+            </mat-form-field>
+            <mat-slide-toggle [(ngModel)]="config.tts_append_language_to_model"
+                              (ngModelChange)="onConfigChange({tts_append_language_to_model: $event})">
+                Append language to model name (for example, chatterbox-fr)
+            </mat-slide-toggle>
+            <mat-slide-toggle [(ngModel)]="config.tts_warmup_enabled"
+                              (ngModelChange)="onConfigChange({tts_warmup_enabled: $event})">
+                Warm TTS model when the assistant starts
+            </mat-slide-toggle>
+            <mat-slide-toggle [(ngModel)]="config.tts_debug_capture_enabled"
+                              (ngModelChange)="onConfigChange({tts_debug_capture_enabled: $event})">
+                Capture latest raw and processed speech for diagnostics
+            </mat-slide-toggle>
         }
         @if (config.tts_provider === "none") {
             <p>TTS is disabled</p>

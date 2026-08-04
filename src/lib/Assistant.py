@@ -241,8 +241,6 @@ class Assistant:
                 glitch["min_seconds"] = float(glitch["min_seconds"]) * intensity
             if isinstance(glitch.get("max_seconds"), (int, float)):
                 glitch["max_seconds"] = float(glitch["max_seconds"]) * intensity
-            if isinstance(glitch.get("detune_base"), (int, float)):
-                glitch["detune_base"] = float(glitch["detune_base"]) * intensity
             if isinstance(glitch.get("detune_peak"), (int, float)):
                 glitch["detune_peak"] = float(glitch["detune_peak"]) * intensity
 

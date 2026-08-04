@@ -1,5 +1,6 @@
 import queue
 import math
+import os
 import re
 import random
 import threading
@@ -99,7 +100,6 @@ class GlitchState:
     history: deque[bytes]
 
 
-GLITCH_BASE_DETUNE_SEMITONES = 4.0
 GLITCH_BURST_DETUNE_SEMITONES = 12.0
 REVERB_TAIL_HIGHPASS_HZ = 160.0
 
@@ -114,6 +114,7 @@ class TTS:
         postprocessing_config: CharacterTTSPostprocessingConfig | None = None,
         output_device: Optional[str] = None,
         output_volume_multiplier: float = 1.0,
+        debug_capture_enabled: bool = False,
     ):
         self.tts_model = tts_model
         self.voice = voice
@@ -125,6 +126,7 @@ class TTS:
         self.p = pyaudio.PyAudio()
         self.output_device = output_device
         self.output_volume_multiplier = max(0.0, min(1.5, float(output_volume_multiplier)))
+        self.debug_capture_enabled = debug_capture_enabled
         self.read_queue = queue.Queue()
         self.is_aborted = False
         self._is_playing = False
@@ -324,11 +326,23 @@ class TTS:
             "response_ms": None,
             "time_to_first_byte_ms": None,
         }
+        raw_capture_chunks: list[bytes] = []
+        processed_capture_chunks: list[bytes] = []
+
+        def capture_raw(source: Generator[bytes, None, None]) -> Generator[bytes, None, None]:
+            for captured_chunk in source:
+                if self.debug_capture_enabled and captured_chunk:
+                    raw_capture_chunks.append(captured_chunk)
+                yield captured_chunk
+
         audio_stream = self._stream_audio(text, voice_override, stream_metrics)
+        audio_stream = capture_raw(audio_stream)
         if postprocessing:
             audio_stream = self._postprocess_audio(audio_stream, postprocessing)
 
         for chunk in audio_stream:
+            if self.debug_capture_enabled and chunk:
+                processed_capture_chunks.append(chunk)
             total_audio_bytes += len(chunk)
             if first_byte_time is None:
                 first_byte_time = time()
@@ -355,6 +369,24 @@ class TTS:
         if underflow_count > 0:
             self.prebuffer_size *= 2
             log('debug', 'tts underflow detected, total', underflow_count, 'increasing prebuffer size to', self.prebuffer_size)
+
+        if self.debug_capture_enabled:
+            try:
+                capture_root = Path(os.environ['APPDATA']) / 'com.covas-next.ui' / 'debug-audio'
+                capture_root.mkdir(parents=True, exist_ok=True)
+                for capture_name, capture_chunks in (
+                    ('latest-covas-raw.wav', raw_capture_chunks),
+                    ('latest-covas-processed.wav', processed_capture_chunks),
+                ):
+                    if not capture_chunks:
+                        continue
+                    with wave.open(str(capture_root / capture_name), 'wb') as capture_file:
+                        capture_file.setnchannels(1)
+                        capture_file.setsampwidth(2)
+                        capture_file.setframerate(24_000)
+                        capture_file.writeframes(b''.join(capture_chunks))
+            except Exception as capture_error:
+                log('warn', 'Unable to write TTS waveform capture', capture_error)
 
         output_audio_duration_ms = 0.0
         if total_audio_bytes > 0:
@@ -480,7 +512,6 @@ class TTS:
                 'repeat_max': max,
                 'min_seconds': max,
                 'max_seconds': max,
-                'detune_base': max,
                 'detune_peak': max,
             },
         )
@@ -650,54 +681,8 @@ class TTS:
         transformed = np.clip(transformed, -1.0, 1.0)
         return (transformed * 32768.0).astype(np.int16).tobytes()
 
-    def _split_processed_bytes(
-        self,
-        processed_bytes: bytes,
-        chunk_lengths: list[int],
-    ) -> list[bytes]:
-        expected_length = sum(chunk_lengths)
-        if len(processed_bytes) != expected_length:
-            if len(processed_bytes) > expected_length:
-                processed_bytes = processed_bytes[:expected_length]
-            else:
-                processed_bytes = processed_bytes + (b'\x00' * (expected_length - len(processed_bytes)))
-
-        chunks: list[bytes] = []
-        offset = 0
-        for chunk_length in chunk_lengths:
-            chunks.append(processed_bytes[offset:offset + chunk_length])
-            offset += chunk_length
-        return chunks
-
-    def _pitch_shift_chunk_group(
-        self,
-        chunks: list[bytes],
-        pitch_shift_semitones: float,
-        sample_rate: int,
-    ) -> list[bytes]:
-        if not chunks:
-            return []
-        if math.isclose(pitch_shift_semitones, 0.0, abs_tol=1e-6):
-            return list(chunks)
-
-        combined = b''.join(chunks)
-        shifted = self._pitch_shift_chunk(combined, pitch_shift_semitones, sample_rate)
-        return self._split_processed_bytes(shifted, [len(chunk) for chunk in chunks])
-
     def _get_random_glitch_detune(self, semitone_range: float) -> float:
         return random.uniform(-abs(semitone_range), abs(semitone_range))
-
-    def _get_glitch_pitch_hold_bytes(
-        self,
-        effect_config: CharacterTTSGlitchConfig,
-        sample_rate: int,
-    ) -> int:
-        min_seconds = max(0.01, min(0.5, float(effect_config.get('min_seconds', 0.05))))
-        max_seconds = max(0.01, min(0.5, float(effect_config.get('max_seconds', 0.20))))
-        if max_seconds < min_seconds:
-            max_seconds = min_seconds
-        duration = random.uniform(min_seconds, max_seconds)
-        return max(2, int(duration * sample_rate) * 2)
 
     def _transform_time_pitch_audio(
         self,
@@ -1074,12 +1059,7 @@ class TTS:
         sample_rate = 24_000
         effects = config.get('effects', {})
         glitch_config = effects.get('glitch', {})
-        glitch_enabled = isinstance(glitch_config, dict) and bool(glitch_config.get('enabled'))
-        glitch_detune_base = float(glitch_config.get('detune_base', GLITCH_BASE_DETUNE_SEMITONES)) if isinstance(glitch_config, dict) else GLITCH_BASE_DETUNE_SEMITONES
         glitch_detune_peak = float(glitch_config.get('detune_peak', GLITCH_BURST_DETUNE_SEMITONES)) if isinstance(glitch_config, dict) else GLITCH_BURST_DETUNE_SEMITONES
-        base_glitch_detune = 0.0
-        base_glitch_detune_bytes_remaining = 0
-        base_glitch_chunks: list[bytes] = []
 
         time_pitch_config = effects.get('time_pitch', {})
         if isinstance(time_pitch_config, dict):
@@ -1196,8 +1176,10 @@ class TTS:
                 return []
 
             history = self._glitch_state.history
-            probability = float(effect_config.get('probability', 0.0))
-            if not history or random.random() >= probability:
+            probability_per_second = min(1.0, max(0.0, float(effect_config.get('probability', 0.0))))
+            chunk_seconds = len(processed_chunk) / float(sample_rate * 2)
+            trigger_probability = 1.0 - ((1.0 - probability_per_second) ** chunk_seconds)
+            if not history or random.random() >= trigger_probability:
                 history.append(processed_chunk)
                 return []
 
@@ -1242,24 +1224,6 @@ class TTS:
             history.append(processed_chunk)
             return extras
 
-        def flush_base_glitch_chunks() -> Generator[bytes, None, None]:
-            nonlocal base_glitch_chunks
-            if not base_glitch_chunks:
-                return
-
-            shifted_chunks = self._pitch_shift_chunk_group(
-                base_glitch_chunks,
-                base_glitch_detune,
-                sample_rate,
-            )
-            base_glitch_chunks = []
-
-            for shifted_chunk in shifted_chunks:
-                yield shifted_chunk
-                if isinstance(glitch_config, dict):
-                    for extra in apply_glitch(shifted_chunk, glitch_config):
-                        yield extra
-
         for chunk in gen:
             if not chunk:
                 continue
@@ -1296,51 +1260,17 @@ class TTS:
             audio_array = np.clip(audio_array, -1.0, 1.0)
             processed_chunk = (audio_array * 32768).astype(np.int16).tobytes()
 
-            if glitch_enabled:
-                if base_glitch_detune_bytes_remaining <= 0:
-                    yield from flush_base_glitch_chunks()
-                    base_glitch_detune = self._get_random_glitch_detune(glitch_detune_base)
-                    base_glitch_detune_bytes_remaining = self._get_glitch_pitch_hold_bytes(
-                        glitch_config,
-                        sample_rate,
-                    )
-                base_glitch_chunks.append(processed_chunk)
-                base_glitch_detune_bytes_remaining -= len(processed_chunk)
-                if base_glitch_detune_bytes_remaining <= 0:
-                    yield from flush_base_glitch_chunks()
-                continue
-
             yield processed_chunk
 
             if isinstance(glitch_config, dict):
                 for extra in apply_glitch(processed_chunk, glitch_config):
                     yield extra
 
-        if glitch_enabled:
-            yield from flush_base_glitch_chunks()
-
         for reverb_tail_chunk in self._flush_reverb_tail():
             reverb_tail_chunk = np.clip(reverb_tail_chunk, -1.0, 1.0)
             processed_chunk = (reverb_tail_chunk * 32768).astype(np.int16).tobytes()
 
-            if glitch_enabled:
-                if base_glitch_detune_bytes_remaining <= 0:
-                    yield from flush_base_glitch_chunks()
-                    base_glitch_detune = self._get_random_glitch_detune(glitch_detune_base)
-                    base_glitch_detune_bytes_remaining = self._get_glitch_pitch_hold_bytes(
-                        glitch_config,
-                        sample_rate,
-                    )
-                base_glitch_chunks.append(processed_chunk)
-                base_glitch_detune_bytes_remaining -= len(processed_chunk)
-                if base_glitch_detune_bytes_remaining <= 0:
-                    yield from flush_base_glitch_chunks()
-                continue
-
             yield processed_chunk
-
-        if glitch_enabled:
-            yield from flush_base_glitch_chunks()
 
     def say(
         self,

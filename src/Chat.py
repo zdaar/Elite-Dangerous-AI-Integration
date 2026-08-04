@@ -301,6 +301,27 @@ class Chat:
                     self.config["tts_provider"], tts_config, "tts"
                 )
 
+                if self.ttsModel is not None and self.config.get("tts_warmup_enabled", False):
+                    warmup_language = str(self.config.get("tts_language", "en")).lower()
+                    warmup_text = (
+                        "COVAS en ligne. Tous les systèmes sont opérationnels."
+                        if warmup_language.startswith("fr")
+                        else "COVAS online. All systems are operational."
+                    )
+
+                    def warm_tts_model() -> None:
+                        try:
+                            for _ in self.ttsModel.synthesize(
+                                warmup_text,
+                                self.character["tts_voice"],
+                            ):
+                                pass
+                            log("info", "TTS warm-up completed")
+                        except Exception as warmup_error:
+                            log("warn", "TTS warm-up failed", warmup_error)
+
+                    threading.Thread(target=warm_tts_model, daemon=True).start()
+
         self.tts = TTS(
             tts_model=self.ttsModel,
             voice=self.character["tts_voice"],
@@ -309,6 +330,9 @@ class Chat:
             output_device=self.config["output_device_name"],
             output_volume_multiplier=float(
                 self.config.get("output_volume_multiplier", 1.0)
+            ),
+            debug_capture_enabled=bool(
+                self.config.get("tts_debug_capture_enabled", False)
             ),
         )
         self.stt = STT(

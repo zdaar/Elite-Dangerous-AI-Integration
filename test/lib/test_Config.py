@@ -20,7 +20,7 @@ from src.lib.Config import (
 def test_migrate_empty_allowed_actions_enables_all_current_actions() -> None:
     migrated = migrate({"config_version": 18, "allowed_actions": []})
 
-    assert migrated["config_version"] == 19
+    assert migrated["config_version"] == 20
     assert migrated["allowed_actions"] == default_allowed_actions
     assert all(migrated["allowed_actions"].values())
 
@@ -84,7 +84,7 @@ def test_legacy_backup_update_runs_full_action_migration(monkeypatch) -> None:
         lambda config: None,
     )
     current = {
-        "config_version": 19,
+        "config_version": 20,
         "allowed_actions": default_allowed_actions.copy(),
     }
     legacy_backup = {
@@ -94,10 +94,26 @@ def test_legacy_backup_update_runs_full_action_migration(monkeypatch) -> None:
 
     updated = update_config(current, legacy_backup)  # type: ignore[arg-type]
 
-    assert updated["config_version"] == 19
+    assert updated["config_version"] == 20
     assert updated["allowed_actions"]["fireWeapons"] is True
     assert updated["allowed_actions"]["plotToTarget"] is True
     assert updated["allowed_actions"]["setSpeed"] is False
+
+
+def test_migrate_adds_local_tts_settings_and_preserves_stt_language() -> None:
+    migrated = migrate({
+        "config_version": 19,
+        "allowed_actions": default_allowed_actions.copy(),
+        "stt_language": "fr",
+    })
+
+    assert migrated["config_version"] == 20
+    assert migrated["tts_language"] == "fr"
+    assert migrated["tts_chatterbox_endpoint"] == "http://localhost:8004/v1"
+    assert migrated["tts_qwen3_endpoint"] == "http://localhost:8005/v1"
+    assert migrated["tts_append_language_to_model"] is True
+    assert migrated["tts_warmup_enabled"] is False
+    assert migrated["tts_debug_capture_enabled"] is False
 
 
 def test_action_defaults_match_registered_permissions() -> None:

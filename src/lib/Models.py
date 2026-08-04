@@ -1011,7 +1011,23 @@ def create_tts_model(provider: str, config: dict, prefix: str = "tts") -> TTSMod
     speed = float(config.get(f"{prefix}_speed", 1.0))
     voice_instructions = config.get(f"{prefix}_voice_instructions", "") or None
 
-    if provider == "openai" or provider == "custom" or provider == "local-ai-server":
+    local_model_names = {
+        "chatterbox-local": "chatterbox",
+        "qwen3-tts-local": "qwen3-tts",
+    }
+    if provider in local_model_names:
+        endpoint_key = (
+            f"{prefix}_chatterbox_endpoint"
+            if provider == "chatterbox-local"
+            else f"{prefix}_qwen3_endpoint"
+        )
+        base_url = str(config.get(endpoint_key, ""))
+        model_name = local_model_names[provider]
+        language = str(config.get(f"{prefix}_language", "en") or "en").strip().lower()
+        if config.get(f"{prefix}_append_language_to_model", True) and language:
+            model_name = f"{model_name}-{language}"
+
+    if provider in {"openai", "custom", "local-ai-server", "chatterbox-local", "qwen3-tts-local"}:
         if provider == "openai" and not base_url:
             base_url = "https://api.openai.com/v1"
         return OpenAITTSModel(

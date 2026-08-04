@@ -488,7 +488,6 @@ class CharacterTTSGlitchConfig(TypedDict, total=False):
     repeat_max: int
     min_seconds: float
     max_seconds: float
-    detune_base: float
     detune_peak: float
 
 
@@ -551,7 +550,6 @@ TTS_ENVIRONMENT_EFFECTS_OVERHEATING: CharacterTTSPostprocessingConfig = {
             "repeat_max": 5,
             "min_seconds": 0.06,
             "max_seconds": 0.25,
-            "detune_base": 2.0,
             "detune_peak": 6.0,
         },
         "time_pitch": {
@@ -669,7 +667,6 @@ def get_default_character_tts_postprocessing() -> CharacterTTSPostprocessingConf
                 "repeat_max": 4,
                 "min_seconds": 0.05,
                 "max_seconds": 0.20,
-                "detune_base": 4.0,
                 "detune_peak": 12.0,
             },
             "time_pitch": {
@@ -770,7 +767,6 @@ def _map_character_tts_glitch(raw: object) -> CharacterTTSGlitchConfig:
         "repeat_max": 4,
         "min_seconds": 0.05,
         "max_seconds": 0.20,
-        "detune_base": 4.0,
         "detune_peak": 12.0,
     }
     if not isinstance(raw, dict):
@@ -788,8 +784,6 @@ def _map_character_tts_glitch(raw: object) -> CharacterTTSGlitchConfig:
         glitch['min_seconds'] = float(raw['min_seconds'])
     if isinstance(raw.get('max_seconds'), (int, float)):
         glitch['max_seconds'] = float(raw['max_seconds'])
-    if isinstance(raw.get('detune_base'), (int, float)):
-        glitch['detune_base'] = float(raw['detune_base'])
     if isinstance(raw.get('detune_peak'), (int, float)):
         glitch['detune_peak'] = float(raw['detune_peak'])
     return glitch
@@ -923,10 +917,16 @@ class Config(TypedDict):
     stt_language: str
     stt_custom_prompt: str
     stt_required_word: str
-    tts_provider: Literal['openai', 'edge-tts', 'custom', 'none', 'local-ai-server']
+    tts_provider: Literal['openai', 'edge-tts', 'custom', 'none', 'local-ai-server', 'chatterbox-local', 'qwen3-tts-local']
     tts_model_name: str
     tts_api_key: str
     tts_endpoint: str
+    tts_chatterbox_endpoint: str
+    tts_qwen3_endpoint: str
+    tts_language: str
+    tts_append_language_to_model: bool
+    tts_warmup_enabled: bool
+    tts_debug_capture_enabled: bool
     # Embedding settings
     embedding_provider: Literal['openai', 'google-ai-studio', 'custom', 'none', 'local-ai-server']
     embedding_model_name: str
@@ -1345,6 +1345,15 @@ def migrate(data: dict) -> dict:
         )
         data['config_version'] = 19
 
+    if data['config_version'] < 20:
+        data.setdefault('tts_chatterbox_endpoint', 'http://localhost:8004/v1')
+        data.setdefault('tts_qwen3_endpoint', 'http://localhost:8005/v1')
+        data.setdefault('tts_language', data.get('stt_language') or 'en')
+        data.setdefault('tts_append_language_to_model', True)
+        data.setdefault('tts_warmup_enabled', False)
+        data.setdefault('tts_debug_capture_enabled', False)
+        data['config_version'] = 20
+
     return data
 
 
@@ -1447,7 +1456,7 @@ def getDefaultCharacter(config: Config) -> Character:
 
 def load_config() -> Config:
     defaults: Config = {
-        'config_version': 19,
+        'config_version': 20,
         'commander_name': "",
         'characters': [],
         'active_character_index': 0,  # -1 means using the default legacy character
@@ -1508,6 +1517,12 @@ def load_config() -> Config:
         'tts_model_name': "edge-tts",
         'tts_endpoint': "",
         'tts_api_key': "",
+        'tts_chatterbox_endpoint': "http://localhost:8004/v1",
+        'tts_qwen3_endpoint': "http://localhost:8005/v1",
+        'tts_language': "en",
+        'tts_append_language_to_model': True,
+        'tts_warmup_enabled': False,
+        'tts_debug_capture_enabled': False,
         # Embedding defaults
         'embedding_provider': 'openai',
         'embedding_model_name': 'text-embedding-3-small',

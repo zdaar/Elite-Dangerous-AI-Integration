@@ -120,10 +120,24 @@ export interface Config {
     stt_language: string;
     stt_custom_prompt: string;
     stt_required_word: string;
-    tts_provider: "openai" | "edge-tts" | "custom" | "none" | "local-ai-server" | string;
+    tts_provider:
+        | "openai"
+        | "edge-tts"
+        | "custom"
+        | "none"
+        | "local-ai-server"
+        | "chatterbox-local"
+        | "qwen3-tts-local"
+        | string;
     tts_model_name: string;
     tts_api_key: string;
     tts_endpoint: string;
+    tts_chatterbox_endpoint: string;
+    tts_qwen3_endpoint: string;
+    tts_language: string;
+    tts_append_language_to_model: boolean;
+    tts_warmup_enabled: boolean;
+    tts_debug_capture_enabled: boolean;
     // Embedding settings
     embedding_provider: "openai" | "google-ai-studio" | "custom" | "none" | "local-ai-server" | string;
     embedding_model_name: string;

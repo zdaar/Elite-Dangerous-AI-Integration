@@ -6,6 +6,8 @@
 |
 [Download latest version](https://github.com/RatherRude/Elite-Dangerous-AI-Integration/releases)
 
+Developer documentation: [reproducible Windows build](./docs/advanced/windows-build.md).
+
 
 [![A Day in the Life of a Bounty Hunter](./docs/screen/video_thumb.png)](https://www.youtube.com/watch?v=nvuCwwixvxw)
 

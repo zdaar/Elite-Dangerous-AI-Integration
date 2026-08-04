@@ -471,8 +471,8 @@ def test_postprocess_audio_glitch_repeats_previous_chunk(mock_pyaudio, monkeypat
     assert processed_chunks[2] == first + first
 
 
-def test_glitch_effect_applies_base_and_burst_detune(mock_pyaudio, monkeypatch):
-    """Test glitch effect adds subtle base detune and stronger glitch detune"""
+def test_glitch_effect_only_detunes_the_explicit_burst(mock_pyaudio, monkeypatch):
+    """Base detune must not cut normal speech into independently shifted blocks."""
     monkeypatch.setattr("src.lib.TTS.random.random", lambda: 0.0)
     monkeypatch.setattr("src.lib.TTS.random.randint", lambda _a, _b: 2)
 
@@ -492,7 +492,6 @@ def test_glitch_effect_applies_base_and_burst_detune(mock_pyaudio, monkeypatch):
 
     monkeypatch.setattr(tts, "_transform_time_pitch_audio", fake_transform)
     monkeypatch.setattr(tts, "_get_random_glitch_detune", fake_random_detune)
-    monkeypatch.setattr(tts, "_get_glitch_pitch_hold_bytes", lambda _config, _sample_rate: 32)
 
     config = {
         "volume": 1.0,
@@ -502,7 +501,6 @@ def test_glitch_effect_applies_base_and_burst_detune(mock_pyaudio, monkeypatch):
                 "probability": 1.0,
                 "repeat_min": 2,
                 "repeat_max": 2,
-                "detune_base": 3.0,
                 "detune_peak": 7.0,
             },
         },
@@ -513,13 +511,36 @@ def test_glitch_effect_applies_base_and_burst_detune(mock_pyaudio, monkeypatch):
     processed_chunks = list(tts._postprocess_audio(iter([first, second]), config))
 
     assert len(processed_chunks) == 3
-    assert detune_ranges == [3.0, 7.0]
-    assert pitch_shift_calls == pytest.approx([1.5, 1.5])
-    assert shifted_lengths == [4, 4]
+    assert detune_ranges == [7.0]
+    assert pitch_shift_calls == pytest.approx([1.5])
+    assert shifted_lengths == [4]
 
 
-def test_glitch_config_maps_detune_ranges():
-    """Test glitch config keeps detune range settings"""
+def test_glitch_probability_is_normalized_by_chunk_duration(mock_pyaudio, monkeypatch):
+    """An 11% intensity must not become an 11% chance on every 20 ms chunk."""
+    monkeypatch.setattr("src.lib.TTS.random.random", lambda: 0.05)
+
+    tts = TTS(None)
+    config = {
+        "volume": 1.0,
+        "effects": {
+            "glitch": {
+                "enabled": True,
+                "probability": 0.11,
+                "repeat_min": 2,
+                "repeat_max": 2,
+            },
+        },
+    }
+    chunk = np.zeros(480, dtype=np.int16).tobytes()
+
+    processed_chunks = list(tts._postprocess_audio(iter([chunk, chunk]), config))
+
+    assert processed_chunks == [chunk, chunk]
+
+
+def test_glitch_config_maps_burst_detune_and_drops_legacy_base_detune():
+    """Legacy base detune is discarded because it introduced speech cuts."""
     config = map_character_tts_postprocessing({
         "effects": {
             "glitch": {
@@ -530,7 +551,7 @@ def test_glitch_config_maps_detune_ranges():
         },
     })
 
-    assert config["effects"]["glitch"]["detune_base"] == pytest.approx(2.5)
+    assert "detune_base" not in config["effects"]["glitch"]
     assert config["effects"]["glitch"]["detune_peak"] == pytest.approx(9.5)
 
 

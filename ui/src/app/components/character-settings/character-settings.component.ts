@@ -163,6 +163,7 @@ export class CharacterSettingsComponent implements OnDestroy, AfterViewInit {
         { id: "double", label: "Noticeable Double", config: { enabled: true, delay_ms: 24, depth_ms: 8, rate_hz: 0.24, mix: 0.28 } },
         { id: "hologram", label: "Wide", config: { enabled: true, delay_ms: 22, depth_ms: 11, rate_hz: 0.32, mix: 0.35 } },
         { id: "shimmer", label: "Shimmery", config: { enabled: true, delay_ms: 18, depth_ms: 9, rate_hz: 0.42, mix: 0.22 } },
+        { id: "smooth-pitch-drift", label: "Pitch Drift (Smooth)", config: { enabled: true, delay_ms: 12, depth_ms: 3, rate_hz: 0.12, mix: 0.18 } },
         { id: "dreamlike", label: "Warbly", config: { enabled: true, delay_ms: 28, depth_ms: 14, rate_hz: 0.2, mix: 0.4 } },
         { id: "alien-resonance", label: "Very Warbly", config: { enabled: true, delay_ms: 32, depth_ms: 18, rate_hz: 0.48, mix: 0.5 } },
     ];
@@ -180,14 +181,13 @@ export class CharacterSettingsComponent implements OnDestroy, AfterViewInit {
     ];
     readonly glitchPresets: VoiceEffectPresetOption<CharacterTTSGlitchConfig>[] = [
         { id: "off", label: "Off", config: null },
-        { id: "minor-dropouts", label: "Occasional Dropouts", config: { enabled: true, probability: 0.03, repeat_min: 2, repeat_max: 2, detune_base: 0.5, detune_peak: 2.0 } },
-        { id: "packet-loss", label: "Packet Loss", config: { enabled: true, probability: 0.06, repeat_min: 2, repeat_max: 3, detune_base: 1.0, detune_peak: 4.0 } },
-        { id: "signal-jitter", label: "Signal Jitter", config: { enabled: true, probability: 0.08, min_seconds: 0.03, max_seconds: 0.08, detune_base: 1.5, detune_peak: 4.5 } },
-        { id: "stutter", label: "Stutter", config: { enabled: true, probability: 0.1, repeat_min: 2, repeat_max: 4, detune_base: 0.75, detune_peak: 3.0 } },
-        { id: "pitch-drift", label: "Pitch Drift", config: { enabled: true, probability: 0.11, min_seconds: 0.06, max_seconds: 0.14, detune_base: 2.5, detune_peak: 6.5 } },
-        { id: "corrupted-signal", label: "Corrupted", config: { enabled: true, probability: 0.15, repeat_min: 2, repeat_max: 4, min_seconds: 0.05, max_seconds: 0.14, detune_base: 3.0, detune_peak: 8.0 } },
-        { id: "broken-broadcast", label: "Badly Corrupted", config: { enabled: true, probability: 0.18, repeat_min: 3, repeat_max: 5, min_seconds: 0.06, max_seconds: 0.18, detune_base: 3.5, detune_peak: 10.0 } },
-        { id: "severe-malfunction", label: "Severely Broken", config: { enabled: true, probability: 0.22, repeat_min: 3, repeat_max: 6, min_seconds: 0.08, max_seconds: 0.2, detune_base: 4.0, detune_peak: 12.0 } },
+        { id: "minor-dropouts", label: "Occasional Dropouts", config: { enabled: true, probability: 0.03, repeat_min: 2, repeat_max: 2, detune_peak: 2.0 } },
+        { id: "packet-loss", label: "Packet Loss", config: { enabled: true, probability: 0.06, repeat_min: 2, repeat_max: 3, detune_peak: 4.0 } },
+        { id: "signal-jitter", label: "Signal Jitter", config: { enabled: true, probability: 0.08, min_seconds: 0.03, max_seconds: 0.08, detune_peak: 4.5 } },
+        { id: "stutter", label: "Stutter", config: { enabled: true, probability: 0.1, repeat_min: 2, repeat_max: 4, detune_peak: 3.0 } },
+        { id: "corrupted-signal", label: "Corrupted", config: { enabled: true, probability: 0.15, repeat_min: 2, repeat_max: 4, min_seconds: 0.05, max_seconds: 0.14, detune_peak: 8.0 } },
+        { id: "broken-broadcast", label: "Badly Corrupted", config: { enabled: true, probability: 0.18, repeat_min: 3, repeat_max: 5, min_seconds: 0.06, max_seconds: 0.18, detune_peak: 10.0 } },
+        { id: "severe-malfunction", label: "Severely Broken", config: { enabled: true, probability: 0.22, repeat_min: 3, repeat_max: 6, min_seconds: 0.08, max_seconds: 0.2, detune_peak: 12.0 } },
     ];
     readonly timePitchPresets: VoiceEffectPresetOption<CharacterTTSTimePitchConfig>[] = [
         { id: "natural", label: "Natural", config: null },
@@ -1020,7 +1020,6 @@ export class CharacterSettingsComponent implements OnDestroy, AfterViewInit {
                     repeat_max: 4,
                     min_seconds: 0.05,
                     max_seconds: 0.2,
-                    detune_base: 4.0,
                     detune_peak: 12.0,
                     ...presetConfig as CharacterTTSGlitchConfig,
                 };
