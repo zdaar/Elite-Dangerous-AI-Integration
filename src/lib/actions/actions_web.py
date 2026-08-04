@@ -14,6 +14,7 @@ from ..EventManager import EventManager
 from ..Logger import log, PromptUsageStats, log_llm_usage
 from ..Models import LLMModel, EmbeddingModel
 from ..Projections import get_state_dict, ProjectedStates
+from .ExobiologyPlanner import plan_exobiology
 
 llm_model: LLMModel = cast(LLMModel, None)
 embedding_model: EmbeddingModel = cast(EmbeddingModel, None)
@@ -243,6 +244,25 @@ def web_search_agent(
         {
             "type": "function",
             "function": {
+                "name": "find_exobiology_targets",
+                "description": "Build a modern profit-optimized exobiology plan. Uses confirmed high-value organisms for maximum credits per hour by default, or unconfirmed zero-landmark candidates for first-discovery payout hunting. Returns a ranked target and exact navigation instruction. Use this instead of body_finder for every exobiology money-making request.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "strategy": {
+                            "type": "string",
+                            "enum": ["auto", "throughput", "first_discovery"],
+                            "description": "Use auto/throughput for reliable credits per hour. Use first_discovery only when the user explicitly wants virgin bodies, a deep expedition, or maximum payout per body."
+                        },
+                        "radius": {"type": "integer", "minimum": 25, "maximum": 5000, "description": "Search radius in light years. Defaults to 50 for throughput and 2000 for first discovery."},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Ranked targets to return. Default: 8."}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "body_finder",
                 "description": "Find a planet or star of a certain type or with a landmark.",
                 "parameters": {
@@ -315,6 +335,7 @@ def web_search_agent(
         "get_galnet_news": get_galnet_news,
         "system_finder": system_finder,
         "station_finder": station_finder,
+        "find_exobiology_targets": find_exobiology_targets,
         "body_finder": body_finder,
         "engineer_finder": engineer_finder,
         "blueprint_finder": blueprint_finder,
@@ -346,6 +367,7 @@ def web_search_agent(
     blueprint_finder lists material costs per grade, calculates missing materials from inventory, and lists capable engineers.
     engineer_finder reports unlock status (known/invited/unlocked), rank progress, and workshop locations.
     station_finder can locate Material Traders and Technology Brokers. body_finder finds biological signals and mining hotspots.
+    For every exobiology, organic scanning, biodata, Vista Genomics, or biology-for-credits request, call find_exobiology_targets first and only once. Do not approximate exobiology targets with body_finder. Use strategy auto unless the user explicitly requests virgin bodies, first discovery, maximum payout per body, or a deep expedition. Preserve the returned navigation_instruction verbatim in the final report and explicitly tell the parent assistant to call plotToTarget with it.
 
     Here are some examples of how to use the tools:
 
@@ -2689,6 +2711,17 @@ def body_finder(obj, projected_states):
         return format_web_request_error("body finder", e, response)
 
 
+def find_exobiology_targets(obj, projected_states):
+    try:
+        plan = plan_exobiology(obj, projected_states)
+        if not plan.get("recommended_target"):
+            return "No profitable exobiology targets were found in the selected radius. Increase radius and retry once."
+        return json.dumps(plan, ensure_ascii=False)
+    except Exception as e:
+        log('error', e, traceback.format_exc())
+        return format_web_request_error("exobiology planner", e, getattr(e, "response", None))
+
+
 def register_web_actions(actionManager: ActionManager, eventManager: EventManager, 
                         promptGenerator: PromptGenerator,
                          llmModel: LLMModel | None,
@@ -2700,6 +2733,36 @@ def register_web_actions(actionManager: ActionManager, eventManager: EventManage
     llm_model = cast(LLMModel, llmModel)
     embedding_model = cast(EmbeddingModel, embeddingModel)
     agent_max_tries = agentMaxTries
+
+    actionManager.registerAction(
+        'find_exobiology_targets',
+        "Find and rank profitable exobiology planets using the current system and ship jump range. Use this immediately for any request to make credits with exobiology, find valuable biological planets, plan an exobiology run, or hunt first discoveries. Default strategy 'auto' maximizes reliable credits per hour. After this succeeds, immediately call plotToTarget with the returned navigation_instruction unless the user explicitly asked for information only. Do not call web_search_agent first and do not ask for confirmation.",
+        {
+            "type": "object",
+            "properties": {
+                "strategy": {
+                    "type": "string",
+                    "enum": ["auto", "throughput", "first_discovery"],
+                    "description": "auto/throughput maximizes reliable credits per hour; first_discovery hunts unconfirmed zero-landmark candidates for a possible 5x payout."
+                },
+                "radius": {
+                    "type": "integer",
+                    "minimum": 25,
+                    "maximum": 5000,
+                    "description": "Search radius in light years. Omit for the efficient strategy default."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Number of ranked targets. Default: 8."
+                }
+            }
+        },
+        find_exobiology_targets,
+        'web',
+        input_template=lambda i, s: "Optimizing exobiology targets",
+    )
 
     actionManager.registerAction(
         'web_search_agent',
