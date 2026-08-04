@@ -1,6 +1,9 @@
 import json
 import math
+import os
+import re
 import time
+from pathlib import Path
 from typing import Any, Literal
 
 import requests
@@ -23,6 +26,22 @@ class PlannerParameters(BaseModel):
 
 class FieldGuideParameters(BaseModel):
     genuses: list[str] = Field(description="Biological genera shown by the Detailed Surface Scanner filters")
+
+
+class GuideLookupParameters(BaseModel):
+    query: str = Field(min_length=3, description="The exact Elite Dangerous mechanics question to verify")
+    max_chunks: int = Field(default=5, ge=1, le=8)
+
+
+FRENCH_SEARCH_TERMS = {
+    "chercher": "find locate search", "trouver": "find locate", "atterrir": "land landing terrain",
+    "échantillon": "sample sampling genetic sampler", "echantillon": "sample sampling genetic sampler",
+    "scanner": "scan scanner pulse DSS", "distance": "distance separation colony range",
+    "valeur": "value credits payout", "combinaison": "suit Artemis", "planète": "planet body",
+    "planete": "planet body", "espèce": "species organism genus", "espece": "species organism genus",
+    "première découverte": "first discovery bonus first logged", "premiere decouverte": "first discovery bonus first logged",
+    "route": "route routing", "vendre": "sell Vista Genomics", "filtre": "filter DSS overlay",
+}
 
 
 FIELD_GUIDE = {
@@ -175,11 +194,70 @@ def _field_guide(parameters: FieldGuideParameters, _context: dict[str, Any]) -> 
     }, ensure_ascii=False)
 
 
+def _knowledge_root() -> Path | None:
+    configured = os.environ.get("COVAS_ELITE_GUIDE_PATH")
+    candidates = [
+        Path(configured) if configured else None,
+        Path.home() / "COVAS-Elite-Guide",
+        Path(os.environ.get("USERPROFILE", "")) / "Claude" / "Projects" / "Elite Dangerous" / ".claude" / "skills",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_dir():
+            return candidate
+    return None
+
+
+def _chunks(text: str) -> list[str]:
+    parts = re.split(r"(?=^#{1,4}\s+)", text, flags=re.MULTILINE)
+    return [part.strip() for part in parts if len(part.strip()) >= 40]
+
+
+def _guide_lookup(parameters: GuideLookupParameters, _context: dict[str, Any]) -> str:
+    root = _knowledge_root()
+    if root is None:
+        return json.dumps({"verified": False, "reason": "Local Elite guide repository is unavailable. Do not answer from model knowledge."})
+    expanded = parameters.query.casefold()
+    for french, english in FRENCH_SEARCH_TERMS.items():
+        if french in expanded:
+            expanded += " " + english
+    terms = {term for term in re.findall(r"[a-zà-ÿ0-9]{3,}", expanded) if term not in {"the", "and", "pour", "avec", "dans", "une", "des", "les", "que", "quoi", "comment"}}
+    matches = []
+    for path in root.rglob("*.md"):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        for chunk in _chunks(text):
+            lowered = chunk.casefold()
+            score = sum(3 if term in lowered[:200] else 1 for term in terms if term in lowered)
+            if score:
+                matches.append((score, str(path.relative_to(root)), chunk[:2400]))
+    matches.sort(key=lambda item: (-item[0], len(item[2])))
+    evidence = [{"source": source, "content": content} for _, source, content in matches[:parameters.max_chunks]]
+    return json.dumps({
+        "verified": bool(evidence),
+        "question": parameters.query,
+        "evidence": evidence,
+        "response_contract": (
+            "Answer only with facts explicitly present in evidence and cite the source filename orally only if useful. "
+            "Do not add model knowledge, conversational memory, inferred controls, coordinates, or roleplay. "
+            "If evidence is insufficient, say 'Guide local insuffisant' and perform one sourced search."
+        ),
+    }, ensure_ascii=False)
+
+
 class ExobiologyProfitPlannerPlugin(PluginBase):
     def __init__(self, plugin_manifest: PluginManifest):
         super().__init__(plugin_manifest)
 
     def on_chat_start(self, helper: PluginHelper):
+        helper.register_status_generator(lambda _states: [("Authoritative Elite facts policy", {
+            "rule": "For every Elite Dangerous gameplay or system fact, call lookup_elite_guide before answering.",
+            "forbidden_sources": ["model training knowledge", "conversation memory", "prior assistant claims", "inference"],
+            "allowed_sources": ["lookup_elite_guide evidence", "an explicit sourced search when local evidence is insufficient"],
+            "failure_response": "Information non vérifiée.",
+            "style": "zero roleplay; concise operational fact only",
+        })])
         if "find_exobiology_targets" not in helper._action_manager.actions:
             helper.register_action(
                 name="find_exobiology_targets",
@@ -206,6 +284,20 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
                 method=_field_guide,
                 action_type="web",
                 input_template=lambda args, _context: "Preparing an on-planet exobiology search order",
+            )
+        if "lookup_elite_guide" not in helper._action_manager.actions:
+            helper.register_action(
+                name="lookup_elite_guide",
+                description=(
+                    "MANDATORY source-of-truth lookup for every factual Elite Dangerous mechanics, system, control, equipment, economy, "
+                    "navigation, exploration, combat, engineering, or exobiology question. Call this before answering even when the answer "
+                    "seems obvious or appeared earlier in conversation. The model's training knowledge and conversational memory are never "
+                    "valid sources for game facts. Relay only returned evidence; if insufficient, use one explicitly sourced web search."
+                ),
+                parameters=GuideLookupParameters,
+                method=_guide_lookup,
+                action_type="web",
+                input_template=lambda args, _context: f"Consulting the verified Elite guide: {args.get('query', '')}",
             )
 
     def on_chat_stop(self, helper: PluginHelper):
