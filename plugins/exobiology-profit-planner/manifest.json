@@ -1,0 +1,8 @@
+{
+  "guid": "ad63b62a-666d-4aed-97df-ade8d21d5134",
+  "name": "Exobiology Profit Planner",
+  "version": "1.0.0",
+  "author": "zdaar",
+  "description": "Finds high-profit exobiology targets near the commander's live position.",
+  "entrypoint": "plugin.py"
+}
