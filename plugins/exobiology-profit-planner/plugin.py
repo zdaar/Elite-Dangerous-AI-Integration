@@ -41,6 +41,11 @@ FRENCH_SEARCH_TERMS = {
     "planete": "planet body", "espèce": "species organism genus", "espece": "species organism genus",
     "première découverte": "first discovery bonus first logged", "premiere decouverte": "first discovery bonus first logged",
     "route": "route routing", "vendre": "sell Vista Genomics", "filtre": "filter DSS overlay",
+    "commande": "command say phrase voiceattack", "demander": "request", "amarrage": "docking dock",
+    "réparer": "fix repair diagnostics", "reparer": "fix repair diagnostics",
+    "onglet": "tab panel diagnostics desync", "désynchron": "desync diagnostics panel tracking",
+    "desynchron": "desync diagnostics panel tracking", "poste": "station crew roster assign",
+    "tous": "all take all stations", "affecter": "assign crewman station", "mettre": "assign set",
 }
 
 
@@ -229,7 +234,12 @@ def _guide_lookup(parameters: GuideLookupParameters, _context: dict[str, Any]) -
             continue
         for chunk in _chunks(text):
             lowered = chunk.casefold()
-            score = sum(3 if term in lowered[:200] else 1 for term in terms if term in lowered)
+            present_terms = [term for term in terms if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", lowered)]
+            score = sum(4 if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", lowered[:240]) else 2 if f"`{term}" in lowered else 1 for term in present_terms)
+            if "| say | does |" in lowered:
+                score += 3
+            if "/references/" in f"/{path.relative_to(root)}".replace("\\", "/"):
+                score += 2
             if score:
                 matches.append((score, str(path.relative_to(root)), chunk[:2400]))
     matches.sort(key=lambda item: (-item[0], len(item[2])))
