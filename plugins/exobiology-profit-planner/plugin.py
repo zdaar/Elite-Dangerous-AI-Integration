@@ -1,27 +1,22 @@
 import json
-import math
 import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Literal
 
-import requests
 from pydantic import BaseModel, Field
 
 from lib.PluginBase import PluginBase, PluginManifest
 from lib.PluginHelper import PluginHelper
-
-
-ROUTE_URL = "https://spansh.co.uk/api/exobiology/route"
-RESULT_URL = "https://spansh.co.uk/api/results/{job_id}"
-HEADERS = {"User-Agent": "COVAS-NEXT/exobiology-profit-planner"}
+from lib.actions.ExobiologyPlanner import plan_exobiology
 
 
 class PlannerParameters(BaseModel):
-    strategy: Literal["auto", "throughput"] = "auto"
-    radius: int = Field(default=50, ge=25, le=5000)
+    strategy: Literal["auto", "stratum_sniping", "throughput", "first_discovery"] = "auto"
+    radius: int | None = Field(default=None, ge=25, le=5000)
     max_results: int = Field(default=8, ge=1, le=20)
+    max_arrival_ls: int = Field(default=1700, ge=100, le=100000)
 
 
 class FieldGuideParameters(BaseModel):
@@ -31,6 +26,16 @@ class FieldGuideParameters(BaseModel):
 class GuideLookupParameters(BaseModel):
     query: str = Field(min_length=3, description="The exact Elite Dangerous mechanics question to verify")
     max_chunks: int = Field(default=5, ge=1, le=8)
+
+
+class TectonicasExpeditionParameters(BaseModel):
+    max_systems: int = Field(default=10, ge=1, le=20)
+    search_radius_ly: int = Field(default=500, ge=25, le=5000)
+    max_arrival_ls: int = Field(default=1700, ge=100, le=100000)
+
+
+class ExpeditionControlParameters(BaseModel):
+    operation: Literal["start", "next", "status", "previous", "reset"] = "status"
 
 
 FRENCH_SEARCH_TERMS = {
@@ -50,7 +55,7 @@ FRENCH_SEARCH_TERMS = {
 
 
 FIELD_GUIDE = {
-    "stratum": {"priority": 1, "terrain": "flat, open plains; avoid broken ground", "appearance": "broad layered mats or low plate-like colonies", "method": "Use the DSS Stratum filter; fly low over the brightest solid-colour patches, land with long clear sight-lines."},
+    "stratum": {"priority": 1, "terrain": "flat, open plains inside the Stratum overlay; avoid broken ground", "appearance": "broad layered mats or low plate-like colonies", "method": "Use the DSS Stratum filter to find compatible terrain, then fly low over flat areas and land with long clear sight-lines. Overlay brightness or colour intensity does not indicate organism density."},
     "clypeus": {"priority": 2, "terrain": "rocky slopes and rough highlands, not flat plains", "appearance": "large upright fan/shell structures", "method": "Use the Clypeus filter; search illuminated rocky slopes from the ship or SRV."},
     "tussock": {"priority": 5, "terrain": "open plains and gentle slopes", "appearance": "small grass-like clumps", "method": "Use the Tussock filter; low-altitude visual search or SRV because individual clumps are small."},
     "frutexa": {"priority": 4, "terrain": "rocky ground, slopes and foothills", "appearance": "bushy branching shrubs", "method": "Use the Frutexa filter; scan rough foothills rather than smooth plains."},
@@ -78,105 +83,60 @@ def _state(context: dict[str, Any], name: str) -> dict[str, Any]:
     return _as_dict(value)
 
 
-def _location(context: dict[str, Any]) -> str:
-    location = _state(context, "Location")
-    system = str(location.get("StarSystem") or location.get("star_system") or "").strip()
-    if not system or system.casefold() == "unknown":
-        raise ValueError("Current system is unknown; wait for a Location or FSDJump event.")
-    return system
-
-
-def _jump_range(context: dict[str, Any]) -> float:
-    ship = _state(context, "ShipInfo")
-    loadout = _state(context, "Loadout")
-    for value in (
-        ship.get("CurrentJumpRange"), ship.get("MaximumJumpRange"),
-        ship.get("ReportedMaximumJumpRange"), loadout.get("MaxJumpRange"),
-    ):
-        if isinstance(value, (int, float)) and value > 0:
-            return round(float(value), 2)
-    return 35.0
-
-
-def _poll(job_id: str) -> list[dict[str, Any]]:
-    deadline = time.monotonic() + 25
-    while time.monotonic() < deadline:
-        response = requests.get(RESULT_URL.format(job_id=job_id), headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("state") == "failed":
-            raise RuntimeError(payload.get("error") or "Spansh route failed")
-        if payload.get("state") == "completed" or payload.get("result"):
-            return payload.get("result") or []
-        time.sleep(0.5)
-    raise TimeoutError("Spansh route did not finish within 25 seconds")
-
-
-def _jumps(source: dict[str, Any], target: dict[str, Any], jump_range: float) -> int:
-    delta = [float(target.get(a) or 0) - float(source.get(a) or 0) for a in ("x", "y", "z")]
-    return max(1, math.ceil(math.sqrt(sum(v * v for v in delta)) / max(jump_range, 1) * 1.1))
-
-
 def _plan(parameters: PlannerParameters, context: dict[str, Any]) -> str:
-    source_system = _location(context)
-    jump_range = _jump_range(context)
-    response = requests.post(
-        ROUTE_URL,
-        data={
-            "from": source_system,
-            "range": str(jump_range),
-            "radius": str(parameters.radius),
-            "max_results": str(parameters.max_results),
-            "min_value": "16000000",
-            "loop": "0",
-        },
-        headers=HEADERS,
-        timeout=20,
+    args = parameters.model_dump(exclude_none=True)
+    plan = plan_exobiology(args, context)
+    plan["next_action"] = (
+        "Call plotToTarget for navigation_instruction immediately. For Stratum sniping, plot the system first; "
+        "after arrival select or FSS-resolve only targeted_fss_bodies. Never run a full-system FSS."
     )
-    response.raise_for_status()
-    job_id = response.json().get("job")
-    if not job_id:
-        raise RuntimeError("Spansh did not return a route job id")
+    return json.dumps(plan, ensure_ascii=False)
 
-    result = _poll(job_id)
-    targets: list[dict[str, Any]] = []
-    if result:
-        source = result[0]
-        for system in result[1:]:
-            jumps = _jumps(source, system, jump_range)
-            for body in system.get("bodies") or []:
-                organisms = [
-                    {"species": item.get("subtype") or item.get("type"), "value": int(item.get("value") or 0)}
-                    for item in body.get("landmarks") or []
-                    if item.get("subtype") or item.get("type")
-                ]
-                priority_value = sum(item["value"] for item in organisms)
-                total_value = int(body.get("landmark_value") or priority_value)
-                arrival = float(body.get("distance_to_arrival") or 0)
-                seconds = max(60, round(jumps * 50 + 35 + 0.75 * math.sqrt(arrival) + 150 + max(1, len(organisms)) * 180))
-                targets.append({
-                    "system": system.get("name"), "body": body.get("name"),
-                    "estimated_jumps": jumps, "distance_to_arrival_ls": round(arrival, 1),
-                    "confirmed_total_value": total_value, "priority_species": organisms,
-                    "estimated_credits_per_hour": round((priority_value or total_value) / seconds * 3600),
-                })
-    targets.sort(key=lambda x: (-x["estimated_credits_per_hour"], -x["confirmed_total_value"]))
-    targets = targets[:parameters.max_results]
-    best = targets[0] if targets else None
-    return json.dumps({
-        "strategy": "confirmed_throughput",
-        "source_system": source_system,
-        "jump_range": jump_range,
-        "targets": targets,
-        "recommended_target": best,
-        "navigation_instruction": {"system": best["system"], "body": best["body"]} if best else None,
-        "next_action": "Immediately call plotToTarget for navigation_instruction.system; do not ask for confirmation.",
-        "operational_notes": [
-            "Complete all three samples before starting another species.",
-            "Prioritize listed high-value organisms and skip low-value detours.",
-            "Unsold biodata is lost on death.",
-        ],
-    }, ensure_ascii=False)
+
+def _expedition_queue(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten clustered system results without dropping any candidate body."""
+    queue: list[dict[str, Any]] = []
+    for system_index, system_target in enumerate(plan.get("targets") or [], start=1):
+        system = str(system_target.get("system") or "").strip()
+        bodies = system_target.get("bodies") or []
+        if not bodies and system_target.get("body"):
+            bodies = [{"body": system_target["body"]}]
+        body_names = [
+            str(body.get("body") or "").strip()
+            for body in bodies
+            if str(body.get("body") or "").strip()
+        ]
+        if not system or not body_names:
+            continue
+        for body_index, body in enumerate(bodies, start=1):
+            body_name = str(body.get("body") or "").strip()
+            if not body_name:
+                continue
+            queue.append({
+                "system": system,
+                "body": body_name,
+                "system_queue_position": system_index,
+                "body_queue_position": body_index,
+                "body_count_in_system": len(body_names),
+                "targeted_fss_bodies": body_names,
+                "distance_to_arrival_ls": body.get("distance_to_arrival_ls"),
+                "atmosphere": body.get("atmosphere"),
+                "gravity_g": body.get("gravity_g"),
+                "surface_temperature_k": body.get("surface_temperature_k"),
+                "updated_at": body.get("updated_at"),
+                "distance_ly": system_target.get("distance_ly"),
+                "distance_from_sol_ly": system_target.get("distance_from_sol_ly"),
+                "estimated_jumps": system_target.get("estimated_jumps"),
+                "route_order": system_target.get("route_order"),
+                "confidence_tier": system_target.get("confidence_tier"),
+                "confidence": system_target.get("confidence"),
+                "instruction": (
+                    f"In {system}, select {body_name} directly if it is exposed. Otherwise resolve only these HMC bodies in FSS: "
+                    f"{', '.join(body_names)}. Stop after the listed bodies; do not scan the rest of the system. "
+                    "Check BioInsights, then DSS only if Stratum is predicted."
+                ),
+            })
+    return queue
 
 
 def _field_guide(parameters: FieldGuideParameters, _context: dict[str, Any]) -> str:
@@ -259,23 +219,183 @@ def _guide_lookup(parameters: GuideLookupParameters, _context: dict[str, Any]) -
 class ExobiologyProfitPlannerPlugin(PluginBase):
     def __init__(self, plugin_manifest: PluginManifest):
         super().__init__(plugin_manifest)
+        self._helper: PluginHelper | None = None
+        self._expedition_file: Path | None = None
+
+    def _load_expedition(self) -> dict[str, Any] | None:
+        if self._expedition_file is None or not self._expedition_file.exists():
+            return None
+        try:
+            return json.loads(self._expedition_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _save_expedition(self, expedition: dict[str, Any]) -> None:
+        if self._expedition_file is None:
+            raise RuntimeError("Expedition storage is unavailable")
+        self._expedition_file.write_text(json.dumps(expedition, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _plot_expedition_target(self, target: dict[str, Any], context: dict[str, Any]) -> Any:
+        if self._helper is None:
+            raise RuntimeError("Plugin helper is unavailable")
+        descriptor = self._helper._action_manager.actions.get("plotToTarget")
+        if not descriptor:
+            raise RuntimeError("plotToTarget is unavailable or disabled")
+        plot_args = {"system": target["system"]}
+        current_system = str(
+            _state(context, "Location").get("StarSystem")
+            or _state(context, "Location").get("star_system")
+            or ""
+        ).strip()
+        target_system = str(target.get("system") or "").strip()
+        body = str(target.get("body") or "").strip()
+        if body and current_system.casefold() == target_system.casefold():
+            # The built-in plotter safely gates in-system body selection on its
+            # navigation capability. Outside the target system, plotting the
+            # system alone avoids trying to select an unreachable body.
+            plot_args["body"] = body
+        result = descriptor["method"](plot_args, context)
+        return {"requested": plot_args, "result": str(result)}
+
+    def _expedition_status(self, states: dict[str, Any]) -> list[tuple[str, Any]]:
+        expedition = self._load_expedition()
+        if not expedition or not expedition.get("targets"):
+            return []
+        index = int(expedition.get("index", 0))
+        targets = expedition["targets"]
+        current = targets[index] if 0 <= index < len(targets) else None
+        return [("Active exobiology expedition", {
+            "strategy": expedition.get("strategy"),
+            "queue_progress": f"{index + 1}/{len(targets)}" if current else "complete",
+            "current_system": _state(states, "Location").get("StarSystem"),
+            "target_system": current.get("system") if current else None,
+            "target_body": current.get("body") if current else None,
+            "targeted_fss_bodies": current.get("targeted_fss_bodies", []) if current else [],
+            "instruction": current.get("instruction") if current else "Queue complete.",
+            "control": "Use control_exobiology_expedition: next, previous, start, status, or reset.",
+        })]
+
+    def _plan_tectonicas_expedition(self, parameters: TectonicasExpeditionParameters, context: dict[str, Any]) -> str:
+        plan = plan_exobiology({
+            "strategy": "stratum_sniping",
+            "radius": parameters.search_radius_ly,
+            "max_results": parameters.max_systems,
+            "max_arrival_ls": parameters.max_arrival_ls,
+        }, context)
+        queue = _expedition_queue(plan)
+        if not queue:
+            return json.dumps({
+                "success": False,
+                "reason": (
+                    "No compatible pre-Odyssey HMC records were returned under the current radius and arrival cap. "
+                    "This does not prove the area has no biology."
+                ),
+                "strategy": plan.get("strategy"),
+                "search_center_coords": plan.get("search_center_coords"),
+            }, ensure_ascii=False)
+        expedition = {
+            "version": 2,
+            "strategy": "stratum_sniping",
+            "source_system": plan.get("source_system"),
+            "source_coords": plan.get("source_coords"),
+            "jump_range": plan.get("jump_range"),
+            "radius_ly": plan.get("radius_ly"),
+            "max_arrival_ls": plan.get("max_arrival_ls"),
+            "outward_staging_applied": plan.get("outward_staging_applied"),
+            "system_count": len(plan.get("targets") or []),
+            "index": 0,
+            "targets": queue,
+            "created_at": time.time(),
+        }
+        self._save_expedition(expedition)
+        plot_result = self._plot_expedition_target(queue[0], context)
+        return json.dumps({
+            "success": True,
+            "strategy": expedition["strategy"],
+            "systems": expedition["system_count"],
+            "body_queue_size": len(queue),
+            "current_target": queue[0],
+            "targeted_fss_bodies": queue[0]["targeted_fss_bodies"],
+            "plot_result": plot_result,
+            "instruction": queue[0]["instruction"],
+            "control": "Say prochaine cible / next target to advance one exact body.",
+            "warning": (
+                "First Footfall is a surface marker and pays no bonus. The 5x bonus requires First Logged when the data is first sold. "
+                "A stale pre-Odyssey record guarantees neither."
+            ),
+        }, ensure_ascii=False)
+
+    def _control_expedition(self, parameters: ExpeditionControlParameters, context: dict[str, Any]) -> str:
+        expedition = self._load_expedition()
+        if not expedition or not expedition.get("targets"):
+            return json.dumps({"success": False, "reason": "No active expedition. Call plan_tectonicas_expedition first."})
+        targets = expedition["targets"]
+        index = int(expedition.get("index", 0))
+        if parameters.operation == "reset":
+            expedition["index"] = 0
+            self._save_expedition(expedition)
+            return json.dumps({
+                "success": True,
+                "queue_progress": f"1/{len(targets)}",
+                "current_target": targets[0],
+                "targeted_fss_bodies": targets[0].get("targeted_fss_bodies", []),
+                "instruction": targets[0].get("instruction"),
+            }, ensure_ascii=False)
+        if parameters.operation == "next":
+            index += 1
+        elif parameters.operation == "previous":
+            index = max(0, index - 1)
+        if index >= len(targets):
+            expedition["index"] = len(targets)
+            self._save_expedition(expedition)
+            return json.dumps({"success": True, "complete": True, "message": "Target queue complete."})
+        expedition["index"] = index
+        self._save_expedition(expedition)
+        target = targets[index]
+        plot_result = None
+        if parameters.operation in {"start", "next", "previous"}:
+            plot_result = self._plot_expedition_target(target, context)
+        return json.dumps({
+            "success": True,
+            "queue_progress": f"{index + 1}/{len(targets)}",
+            "current_system": _state(context, "Location").get("StarSystem"),
+            "current_target": target,
+            "targeted_fss_bodies": target.get("targeted_fss_bodies", []),
+            "instruction": target.get("instruction"),
+            "plot_result": plot_result,
+        }, ensure_ascii=False)
 
     def on_chat_start(self, helper: PluginHelper):
+        self._helper = helper
+        self._expedition_file = Path(helper.get_plugin_data_path(self.plugin_manifest)) / "tectonicas-expedition.json"
         helper.register_status_generator(lambda _states: [("Authoritative Elite facts policy", {
-            "rule": "For every Elite Dangerous gameplay or system fact, call lookup_elite_guide before answering.",
+            "rule": (
+                "Use lookup_elite_guide only for explanatory questions about Elite mechanics or facts. "
+                "Never call it before a direct action, navigation command, status read, or another concrete tool call."
+            ),
+            "action_priority": (
+                "If the commander asks to plot, target, open, close, scan, navigate, control the ship, or use a named tool, "
+                "call the relevant action immediately. Live state and successful tool output are already authoritative."
+            ),
             "forbidden_sources": ["model training knowledge", "conversation memory", "prior assistant claims", "inference"],
-            "allowed_sources": ["lookup_elite_guide evidence", "an explicit sourced search when local evidence is insufficient"],
+            "allowed_sources": [
+                "live state/context", "direct journal events", "successful tool output", "lookup_elite_guide evidence",
+                "an explicit sourced search when local evidence is insufficient",
+            ],
             "failure_response": "Information non vérifiée.",
             "style": "zero roleplay; concise operational fact only",
         })])
+        helper.register_status_generator(self._expedition_status)
         if "find_exobiology_targets" not in helper._action_manager.actions:
             helper.register_action(
                 name="find_exobiology_targets",
                 description=(
-                    "Find and rank a NEW destination planet near the commander's live system for maximum exobiology credits per hour. "
-                    "Use only when asked to find, replace, or optimize a destination. Never use while the commander is asking how to "
-                    "locate or sample organisms on the current planet. After receiving a result, call plotToTarget with the "
-                    "recommended navigation system without asking for confirmation. Do not perform preliminary web searches or status checks."
+                    "Immediately find and rank exobiology money targets from live location. Call this first for requests such as maximize "
+                    "exobiology credits or find me profitable planets; do not run lookup_elite_guide, a web search, "
+                    "or a status probe first. auto, stratum_sniping, and first_discovery use exact pre-Odyssey HMC body records as non-guaranteed "
+                    "Stratum leads; throughput explicitly requests public confirmed organisms for reliable base-value routing. After a result, "
+                    "call plotToTarget with navigation_instruction immediately. For Stratum sniping, honk and resolve only targeted_fss_bodies; "
+                    "never request a full-system FSS. Do not use this when the commander only asks how to sample organisms on the current body."
                 ),
                 parameters=PlannerParameters,
                 method=_plan,
@@ -299,15 +419,44 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             helper.register_action(
                 name="lookup_elite_guide",
                 description=(
-                    "MANDATORY source-of-truth lookup for every factual Elite Dangerous mechanics, system, control, equipment, economy, "
-                    "navigation, exploration, combat, engineering, or exobiology question. Call this before answering even when the answer "
-                    "seems obvious or appeared earlier in conversation. The model's training knowledge and conversational memory are never "
-                    "valid sources for game facts. Relay only returned evidence; if insufficient, use one explicitly sourced web search."
+                    "Source-of-truth lookup for EXPLANATORY questions about Elite Dangerous mechanics, equipment, economy, navigation, "
+                    "exploration, combat, engineering, or exobiology. Do not call this for a direct action request, a basic tool call, "
+                    "a status request answerable from live context, a journal event, or data already returned by another tool. For direct "
+                    "commands, call the requested ship/web action immediately without preliminary lookup or search."
                 ),
                 parameters=GuideLookupParameters,
                 method=_guide_lookup,
                 action_type="web",
                 input_template=lambda args, _context: f"Consulting the verified Elite guide: {args.get('query', '')}",
+            )
+        if "plan_tectonicas_expedition" not in helper._action_manager.actions:
+            helper.register_action(
+                name="plan_tectonicas_expedition",
+                description=(
+                    "Immediately build and persist an efficient fixed queue from pre-Odyssey HMC Stratum leads when the commander asks Nova to "
+                    "manage or plot targets one by one. Do not perform a guide lookup or web search first. Keep every exact candidate body in "
+                    "clustered systems, then plot the first system. At each system, select exposed bodies directly or resolve only the listed HMC "
+                    "bodies in FSS; never instruct a full-system scan. These are stale-record leads, not guarantees of Stratum, First Footfall, "
+                    "or First Logged. First Footfall pays no bonus; First Logged is determined when biodata is first sold."
+                ),
+                parameters=TectonicasExpeditionParameters,
+                method=self._plan_tectonicas_expedition,
+                action_type="web",
+                input_template=lambda args, _context: "Building a persistent outward Tectonicas expedition",
+            )
+        if "control_exobiology_expedition" not in helper._action_manager.actions:
+            helper.register_action(
+                name="control_exobiology_expedition",
+                description=(
+                    "Control the persistent exobiology expedition. For 'prochaine cible', 'next target', or after the commander says the "
+                    "current body is complete, call operation=next immediately without a guide lookup or web search. It advances one exact body; "
+                    "if the next body is in the current system it attempts safe in-system body selection, otherwise it plots the target system. "
+                    "Use status to report the current system/body and targeted FSS list without advancing."
+                ),
+                parameters=ExpeditionControlParameters,
+                method=self._control_expedition,
+                action_type="ship",
+                input_template=lambda args, _context: f"Exobiology expedition: {args.get('operation', 'status')}",
             )
 
     def on_chat_stop(self, helper: PluginHelper):

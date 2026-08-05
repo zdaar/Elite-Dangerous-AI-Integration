@@ -245,17 +245,18 @@ def web_search_agent(
             "type": "function",
             "function": {
                 "name": "find_exobiology_targets",
-                "description": "Build a modern profit-optimized exobiology plan. Uses confirmed high-value organisms for maximum credits per hour by default, or unconfirmed zero-landmark candidates for first-discovery payout hunting. Returns a ranked target and exact navigation instruction. Use this instead of body_finder for every exobiology money-making request.",
+                "description": "Build a profit-optimized exobiology destination plan. Auto uses exact pre-Odyssey HMC body records for controller-friendly Stratum sniping with no full-system FSS; throughput explicitly uses confirmed public organisms for deterministic base-value income. Use this instead of body_finder when asked to find, replace, or optimize an exobiology money target.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "strategy": {
                             "type": "string",
-                            "enum": ["auto", "throughput", "first_discovery"],
-                            "description": "Use auto/throughput for reliable credits per hour. Use first_discovery only when the user explicitly wants virgin bodies, a deep expedition, or maximum payout per body."
+                            "enum": ["auto", "stratum_sniping", "throughput", "first_discovery"],
+                            "description": "Use auto or stratum_sniping for the default exact-body stale-record hunt. Use throughput only for known organisms and reliable base-value income. first_discovery is an alias for stratum_sniping."
                         },
-                        "radius": {"type": "integer", "minimum": 25, "maximum": 5000, "description": "Search radius in light years. Defaults to 50 for throughput and 2000 for first discovery."},
-                        "max_results": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Ranked targets to return. Default: 8."}
+                        "radius": {"type": "integer", "minimum": 25, "maximum": 5000, "description": "Search radius in light years. Defaults to 500 for Stratum sniping and 50 for throughput."},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Ranked system clusters to return. Default: 8."},
+                        "max_arrival_ls": {"type": "integer", "minimum": 100, "maximum": 100000, "description": "Maximum supercruise arrival distance per candidate body. Default: 1700 ls."}
                     }
                 }
             }
@@ -367,7 +368,7 @@ def web_search_agent(
     blueprint_finder lists material costs per grade, calculates missing materials from inventory, and lists capable engineers.
     engineer_finder reports unlock status (known/invited/unlocked), rank progress, and workshop locations.
     station_finder can locate Material Traders and Technology Brokers. body_finder finds biological signals and mining hotspots.
-    For every exobiology, organic scanning, biodata, Vista Genomics, or biology-for-credits request, call find_exobiology_targets first and only once. Do not approximate exobiology targets with body_finder. Use strategy auto unless the user explicitly requests virgin bodies, first discovery, maximum payout per body, or a deep expedition. Preserve the returned navigation_instruction verbatim in the final report and explicitly tell the parent assistant to call plotToTarget with it.
+    When the user asks to find, replace, or optimize an exobiology money destination, call find_exobiology_targets first and only once. Do not approximate targets with body_finder. Use strategy auto unless the user explicitly asks for a public confirmed-organism route, in which case use throughput. Auto already means exact pre-Odyssey Stratum candidates and a possible First Logged payout. Preserve navigation_instruction verbatim and tell the parent assistant to call plotToTarget immediately. The target's `targeted_fss_bodies` are the only bodies to resolve; never recommend a 100% or full-system FSS. Do not call this planner for a question about organisms already shown on the current body, how to sample them, or a direct ship/navigation command.
 
     Here are some examples of how to use the tools:
 
@@ -2736,14 +2737,14 @@ def register_web_actions(actionManager: ActionManager, eventManager: EventManage
 
     actionManager.registerAction(
         'find_exobiology_targets',
-        "Find and rank profitable exobiology planets using the current system and ship jump range. Use this immediately for any request to make credits with exobiology, find valuable biological planets, plan an exobiology run, or hunt first discoveries. Default strategy 'auto' maximizes reliable credits per hour. After this succeeds, immediately call plotToTarget with the returned navigation_instruction unless the user explicitly asked for information only. Do not call web_search_agent first and do not ask for confirmation.",
+        "Find and rank profitable exobiology destinations from the live position and ship jump range. Use immediately when asked to find, replace, or optimize a money target. Auto mines exact pre-Odyssey HMC body records, clusters multiple candidates per system, avoids full-system FSS, and treats First Logged as a heuristic rather than a guarantee. Throughput explicitly uses public confirmed organisms for base-value certainty. After success, call plotToTarget with navigation_instruction unless the user asked for information only. Do not call web_search_agent, body_finder, or a guide lookup first; do not use this action for a current-body sampling question.",
         {
             "type": "object",
             "properties": {
                 "strategy": {
                     "type": "string",
-                    "enum": ["auto", "throughput", "first_discovery"],
-                    "description": "auto/throughput maximizes reliable credits per hour; first_discovery hunts unconfirmed zero-landmark candidates for a possible 5x payout."
+                    "enum": ["auto", "stratum_sniping", "throughput", "first_discovery"],
+                    "description": "auto/stratum_sniping is the default exact-body legacy-record method; throughput is a confirmed public-organism route; first_discovery is an alias for stratum_sniping."
                 },
                 "radius": {
                     "type": "integer",
@@ -2755,7 +2756,13 @@ def register_web_actions(actionManager: ActionManager, eventManager: EventManage
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 20,
-                    "description": "Number of ranked targets. Default: 8."
+                    "description": "Number of ranked system clusters. Default: 8."
+                },
+                "max_arrival_ls": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 100000,
+                    "description": "Maximum candidate-body arrival distance. Default: 1700 ls."
                 }
             }
         },
