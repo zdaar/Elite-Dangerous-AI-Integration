@@ -348,6 +348,7 @@ export class MainViewComponent implements OnInit, OnDestroy {
             await this.tauri.restart_process();
         } catch (error) {
             console.error("Failed to stop:", error);
+            this.isLoading = false;
         }
     }
 

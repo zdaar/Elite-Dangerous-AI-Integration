@@ -80,27 +80,33 @@ export interface Config {
     // Other config settings
     llm_provider:
         | "openai"
+        | "openai-chatgpt"
         | "openrouter"
         | "google-ai-studio"
         | "custom"
         | "local-ai-server";
     llm_model_name: string;
-    llm_reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | null;
+    llm_reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null;
+    llm_text_verbosity: 'default' | 'low' | 'medium' | 'high' | null;
     llm_api_key: string;
     llm_endpoint: string;
     llm_temperature: number;
     agent_llm_provider:
         | "openai"
+        | "openai-chatgpt"
         | "openrouter"
         | "google-ai-studio"
         | "custom"
         | "local-ai-server";
     agent_llm_model_name: string;
-    agent_llm_reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | null;
+    agent_llm_reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null;
+    agent_llm_text_verbosity: 'default' | 'low' | 'medium' | 'high' | null;
     agent_llm_api_key: string;
     agent_llm_endpoint: string;
     agent_llm_temperature: number;
     agent_llm_max_tries: number;
+    codex_app_server_command: string;
+    codex_app_server_timeout: number;
     mute_search: boolean;
     vision_provider: "openai" | "google-ai-studio" | "custom" | "none" | "local-ai-server";
     vision_model_name: string;
@@ -120,10 +126,24 @@ export interface Config {
     stt_language: string;
     stt_custom_prompt: string;
     stt_required_word: string;
-    tts_provider: "openai" | "edge-tts" | "custom" | "none" | "local-ai-server" | string;
+    tts_provider:
+        | "openai"
+        | "edge-tts"
+        | "custom"
+        | "none"
+        | "local-ai-server"
+        | "chatterbox-local"
+        | "qwen3-tts-local"
+        | string;
     tts_model_name: string;
     tts_api_key: string;
     tts_endpoint: string;
+    tts_chatterbox_endpoint: string;
+    tts_qwen3_endpoint: string;
+    tts_language: string;
+    tts_append_language_to_model: boolean;
+    tts_warmup_enabled: boolean;
+    tts_debug_capture_enabled: boolean;
     // Embedding settings
     embedding_provider: "openai" | "google-ai-studio" | "custom" | "none" | "local-ai-server" | string;
     embedding_model_name: string;
@@ -161,6 +181,12 @@ export interface Config {
     reset_game_events?: boolean; // Flag to request resetting game events to defaults
     qol_autobrake: boolean; // Quality of life: Auto brake when approaching stations
     qol_autoscan: boolean; // Quality of life: Auto scan when entering new systems
+    qol_non_kgbfoam_jump_warning: boolean;
+    qol_non_kgbfoam_unknown_warning: boolean;
+    route_safety_close_star_enabled: boolean;
+    route_safety_cancel_dangerous_charge: boolean;
+    route_safety_unknown_system_policy: "allow" | "exclude";
+    route_safety_max_surface_gap_ratio: number;
     
     // Overlay settings
     overlay_show_avatar: boolean;

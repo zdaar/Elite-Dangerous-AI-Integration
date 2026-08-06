@@ -3,7 +3,7 @@ import os
 import pytest
 import time
 
-from src.lib.StatusParser import StatusParser
+from src.lib.StatusParser import StatusParser, parse_status_json
 
 @pytest.fixture
 def status_file_path(tmp_path):
@@ -52,3 +52,31 @@ def test_statusparser_file_update(status_file_path):
 
     landinggear_event = parser.status_queue.get(timeout=10)
     assert landinggear_event["event"] == "LandingGearDown"
+
+
+@pytest.mark.parametrize(
+    ("flags2", "expected_jump_type"),
+    [
+        (524288, "Hyperspace"),
+        (0, "Supercruise"),
+    ],
+)
+def test_fsd_charging_delta_identifies_hyperdrive_vs_supercruise(
+    status_file_path,
+    flags2: int,
+    expected_jump_type: str,
+):
+    parser = StatusParser(str(status_file_path))
+    main_ship = 16777216
+    old_status = parse_status_json({"Flags": main_ship, "Flags2": flags2})
+    new_status = parse_status_json({
+        "Flags": main_ship | 131072,
+        "Flags2": flags2,
+    })
+
+    events = parser._create_delta_events(old_status, new_status)
+
+    assert {
+        "event": "FsdCharging",
+        "JumpType": expected_jump_type,
+    } in events

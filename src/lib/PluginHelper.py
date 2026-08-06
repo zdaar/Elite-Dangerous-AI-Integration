@@ -3,7 +3,7 @@ import os
 from typing import Any, Callable, TypeVar
 
 from .Models import LLMModel, STTModel, TTSModel, EmbeddingModel
-from .Logger import log
+from .Logger import log, show_chat_message
 from .EDKeys import EDKeys
 from .EventManager import EventManager, Projection as _Projection
 from .ActionManager import ActionManager
@@ -99,6 +99,37 @@ class PluginHelper():
             except Exception as e:
                 log('error', f"Plugin sideeffect raised an exception: {e}")
         self._event_manager.register_sideeffect(_sideeffect_wrapper)
+
+    def speak_deterministic(
+        self,
+        text: str,
+        projected_states: ProjectedStates,
+        *,
+        context: str = "plugin",
+    ) -> None:
+        """Show and speak trusted plugin output without an LLM round trip."""
+        message = str(text or "").strip()
+        if not message:
+            return
+
+        show_chat_message("covas", message)
+
+        def on_start() -> None:
+            self._event_manager.add_assistant_speaking()
+
+        def on_complete() -> None:
+            if not self._assistant.tts.has_queued_items():
+                self._event_manager.add_assistant_complete_event()
+
+        self._assistant.tts.say(
+            message,
+            context=context,
+            postprocessing_layers=self._assistant._get_tts_postprocessing_layers(
+                projected_states
+            ),
+            on_start=on_start,
+            on_complete=on_complete,
+        )
 
     def dispatch_event(self, event: PluginEvent):
         """Dispatch an event from an outside source

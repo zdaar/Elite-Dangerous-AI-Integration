@@ -339,6 +339,12 @@ export class AdvancedSettingsComponent implements OnDestroy {
     updateTTSPrompt(prompt: string) {
         this.characterService.setCharacterProperty("tts_prompt", prompt);
     }
+    async onSpeechLanguageChange(language: string) {
+        await this.onConfigChange({
+            tts_language: language,
+            stt_language: language,
+        });
+    }
 
     async onApiKeyChange(apiKey: string) {
         if (!this.config) return;

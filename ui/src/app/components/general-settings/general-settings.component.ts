@@ -235,7 +235,9 @@ export class GeneralSettingsComponent implements OnDestroy {
     }
 
     get commanderReady(): boolean {
-        return !!this.config?.commander_name?.trim() && !!this.config?.api_key?.trim();
+        const llmUsesManagedLogin = this.config?.llm_provider === "openai-chatgpt";
+        return !!this.config?.commander_name?.trim()
+            && (llmUsesManagedLogin || !!this.config?.api_key?.trim());
     }
 
     get soundInputReady(): boolean {

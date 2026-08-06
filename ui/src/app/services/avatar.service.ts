@@ -17,6 +17,12 @@ interface StoredAvatarFile {
   size?: number;
 }
 
+interface AvatarFileInfo {
+  path: string;
+  mimeType: string;
+  managed: boolean;
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -74,15 +80,16 @@ export class AvatarService {
     if (!this.isAbsoluteFilePath(reference)) {
       return null;
     }
-    const file = await this.readAvatarFile(reference);
-    if (!file) {
+    const fileInfo = await this.getAvatarFileInfo(reference);
+    if (!fileInfo) {
       return null;
     }
-    const mimeType = (file.mimeType || 'application/octet-stream').trim();
-    const blob = await this.base64ToBlob(file.dataBase64, mimeType);
+    if (!fileInfo.managed) {
+      return this.getLegacyExternalAvatar(fileInfo.path, fileInfo.mimeType);
+    }
     return {
-      url: URL.createObjectURL(blob),
-      mimeType: blob.type || mimeType,
+      url: this.toUserAssetUrl(fileInfo.path),
+      mimeType: fileInfo.mimeType,
     };
   }
 
@@ -124,11 +131,26 @@ export class AvatarService {
     if (!this.isAbsoluteFilePath(reference)) {
       return null;
     }
-    const file = await this.readAvatarFile(reference);
+    const fileInfo = await this.getAvatarFileInfo(reference);
+    if (!fileInfo) {
+      return null;
+    }
+    if (fileInfo.managed) {
+      const response = await fetch(this.toUserAssetUrl(fileInfo.path));
+      if (!response.ok) {
+        return null;
+      }
+      return response.blob();
+    }
+    const file = await this.readAvatarFile(fileInfo.path);
     if (!file) {
       return null;
     }
-    return this.base64ToBlob(file.dataBase64, file.mimeType || 'application/octet-stream');
+    return this.base64ToBlob(file.dataBase64, file.mimeType || fileInfo.mimeType);
+  }
+
+  private toUserAssetUrl(reference: string): string {
+    return `user-asset://local/file?path=${encodeURIComponent(reference)}`;
   }
 
   private getElectronAPI() {
@@ -150,6 +172,37 @@ export class AvatarService {
     return {
       dataBase64: response.dataBase64,
       mimeType: typeof response.mimeType === 'string' ? response.mimeType : 'application/octet-stream',
+    };
+  }
+
+  private async getAvatarFileInfo(filePath: string): Promise<AvatarFileInfo | null> {
+    const electronAPI = this.getElectronAPI();
+    const response = await (electronAPI.userAssets?.getFileInfo
+      ? electronAPI.userAssets.getFileInfo({ path: filePath })
+      : electronAPI.invoke('get_user_asset_file_info', { path: filePath }));
+    if (!response?.path || typeof response.path !== 'string') {
+      return null;
+    }
+    return {
+      path: response.path,
+      mimeType: typeof response.mimeType === 'string' ? response.mimeType : this.inferMimeType(filePath),
+      managed: response.managed === true,
+    };
+  }
+
+  private async getLegacyExternalAvatar(
+    filePath: string,
+    fallbackMimeType: string,
+  ): Promise<{ url: string; mimeType: string } | null> {
+    const file = await this.readAvatarFile(filePath);
+    if (!file) {
+      return null;
+    }
+    const mimeType = (file.mimeType || fallbackMimeType || 'application/octet-stream').trim();
+    const blob = await this.base64ToBlob(file.dataBase64, mimeType);
+    return {
+      url: URL.createObjectURL(blob),
+      mimeType: blob.type || mimeType,
     };
   }
 

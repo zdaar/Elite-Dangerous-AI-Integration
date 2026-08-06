@@ -5,7 +5,7 @@
             Overview
         </ng-template>
         <div class="tab-content">
-            @if (config && (!config.commander_name || !config.api_key || !usageDisclaimerAccepted) ) {
+            @if (config && (!config.commander_name || (!config.api_key && config.llm_provider !== 'openai-chatgpt') || !usageDisclaimerAccepted) ) {
                 <mat-card appearance="outlined" class="welcome-message" [class.highlight]="highlightDisclaimerCard" style="margin-bottom: 20px;">
                     <mat-card-header>
                         <mat-icon mat-card-avatar color="primary">info</mat-icon>
@@ -130,4 +130,3 @@
         </div>
     </div>
 }
-

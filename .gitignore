@@ -8,6 +8,7 @@ covas*.db
 covas*.db*
 EDAI.log
 build
+build-*/
 dist
 gen
 target

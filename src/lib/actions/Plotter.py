@@ -174,21 +174,24 @@ class Plotter:
 
     @staticmethod
     def spansh_plot_search_name(query: str) -> str:
-        query = str(query).strip()
-        if not query:
-            return query
-        return query[:-1] + "?"
+        # Keep procedural suffixes intact. Replacing the final character with
+        # Spansh's single-character wildcard can silently turn e.g. ``c5-0``
+        # into a match for ``c5-1`` and route to the wrong system.
+        return str(query).strip()
 
     @classmethod
     def _plot_search_obj(cls, query: str) -> dict[str, Any]:
-        return {"name": cls.spansh_plot_search_name(query), "size": 1}
+        return {
+            "name": cls.spansh_plot_search_name(query),
+            "size": PLOT_TARGET_SEARCH_SIZE,
+        }
 
     def _apply_plot_request_routing(self, request_body: dict[str, Any], projected_states: Any) -> dict[str, Any]:
         location = get_state_dict(projected_states, 'Location')
         star_pos = location.get('StarPos')
 
         request_body["sort"] = [{"distance": {"direction": "asc"}}]
-        request_body["size"] = 1
+        request_body["size"] = PLOT_TARGET_SEARCH_SIZE
         request_body.pop("reference_route", None)
         filters = request_body.get("filters", {})
         filters.pop("type", None)
@@ -223,7 +226,7 @@ class Plotter:
 
         for system in data.get("results", [])[:PLOT_TARGET_SEARCH_SIZE]:
             name = str(system.get("name") or "").strip()
-            if not name:
+            if not name or not self.is_plot_name_exact_match(query, name):
                 continue
             distance = system.get("distance")
             distance_value = float(distance) if distance is not None else None
@@ -352,10 +355,23 @@ class Plotter:
         body: str | None = None,
         projected_states: Any,
     ) -> ResolvedPlotTarget | None:
-        query = self.plot_search_query(system=system, station=station, body=body)
-        if not query:
+        # The action schema already tells us which entity type the caller
+        # intends. Respect it instead of querying all three endpoints and
+        # accepting a similarly named entity of another type. In particular,
+        # procedural system names must resolve exactly or fall back to typing
+        # the caller's unchanged system name into the galaxy map.
+        if station and str(station).strip():
+            query = str(station).strip()
+            candidates = self._plot_candidates_from_stations(query, projected_states)
+        elif body and str(body).strip():
+            query = str(body).strip()
+            candidates = self._plot_candidates_from_bodies(query, projected_states)
+        elif system and str(system).strip():
+            query = str(system).strip()
+            candidates = self._plot_candidates_from_systems(query, projected_states)
+        else:
             return None
-        return self.resolve_plot_target(query, projected_states)
+        return self._select_best_plot_target(candidates, query)
 
     def resolve_plot_target(self, query: str, projected_states: Any) -> ResolvedPlotTarget | None:
         query = str(query or "").strip()
@@ -417,13 +433,23 @@ class Plotter:
         if not any((system, station, body)):
             raise Exception("At least one of system, station, or body must be provided.")
 
+        current_system = get_state_dict(projected_states, 'Location').get('StarSystem', 'Unknown')
+        if system and not station and not body:
+            # A caller-supplied system name is already the exact galaxy-map
+            # input. Do not let a fuzzy external catalogue rewrite procedural
+            # suffixes or block systems that have not reached Spansh yet.
+            if nav_route and self._systems_match(nav_route[-1].get('StarSystem', ''), system):
+                return f"The route to {system} is already set"
+            if self._systems_match(system, current_system):
+                return f"Already in {system}."
+            return self._plot_galaxy_route(system, None, projected_states, galaxymap_key)
+
         resolved = self.lookup_plot_target(
             system=system,
             station=station,
             body=body,
             projected_states=projected_states,
         )
-        current_system = get_state_dict(projected_states, 'Location').get('StarSystem', 'Unknown')
 
         if resolved:
             if nav_route and self._systems_match(nav_route[-1].get('StarSystem', ''), resolved.system_name):

@@ -114,9 +114,9 @@
                                     The system will automatically detect the key type and configure settings.</p>
                                 <mat-form-field>
                                     <mat-label>Main API Key (OpenAI/Openrouter/Google AI Studio)</mat-label>
-                                    <input required matInput [type]="hideApiKey ? 'password' : 'text'" [(ngModel)]="config.api_key"
+                                    <input [required]="config.llm_provider !== 'openai-chatgpt'" matInput [type]="hideApiKey ? 'password' : 'text'" [(ngModel)]="config.api_key"
                                            (ngModelChange)="onApiKeyChange($event)"
-                                           pattern="^[A-Za-z0-9_.-]+$"
+                                           pattern="^[A-Za-z0-9_.\-]+$"
                                            #preflightApiKeyInput="ngModel">
                                     <button matSuffix mat-icon-button (mousedown)="hideApiKey = false" (mouseup)="hideApiKey = true"
                                             (mouseleave)="hideApiKey = true">

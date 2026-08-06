@@ -16,6 +16,7 @@ from openai.types.audio.speech_create_params import SpeechCreateParams
 from openai import OpenAI, APIStatusError
 from openai.types.chat import ChatCompletion, ChatCompletionMessageFunctionToolCall, ChatCompletionMessageToolCall
 from openai.types import CreateEmbeddingResponse
+from .CodexAppServer import CodexAppServerClient, CodexAppServerError
 from .Logger import log, ModelUsageStats
 
 class LLMError(Exception):
@@ -201,6 +202,18 @@ def _get_reasoning_tokens(usage: Any) -> int | None:
 
     return None
 
+
+def _is_openai_reasoning_model(model_name: str) -> bool:
+    normalized = model_name.lower().split("/")[-1]
+    return normalized.startswith("gpt-5") or normalized.startswith(
+        ("o1", "o3", "o4")
+    )
+
+
+def _supports_openai_text_verbosity(model_name: str) -> bool:
+    normalized = model_name.lower().split("/")[-1]
+    return normalized.startswith("gpt-5")
+
 class OpenAILLMModel(LLMModel):
     def __init__(self, base_url: str, api_key: str, model_name: str, temperature: float, reasoning_effort: Optional[str] = None, extra_body: Optional[dict] = None, extra_headers: Optional[dict] = None, provider_name: str | None = None):
         super().__init__(model_name, provider_name=provider_name)
@@ -349,12 +362,13 @@ class OpenAILLMModel(LLMModel):
             raise e
 
 class OpenAIResponsesLLMModel(LLMModel):
-    def __init__(self, base_url: str, api_key: str, model_name: str, temperature: float, reasoning_effort: Optional[str] = None, extra_body: Optional[dict] = None, extra_headers: Optional[dict] = None, provider_name: str | None = None):
+    def __init__(self, base_url: str, api_key: str, model_name: str, temperature: float, reasoning_effort: Optional[str] = None, text_verbosity: Optional[str] = None, extra_body: Optional[dict] = None, extra_headers: Optional[dict] = None, provider_name: str | None = None):
         super().__init__(model_name, provider_name=provider_name)
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.base_url = base_url
         self.temperature = temperature
         self.reasoning_effort = reasoning_effort
+        self.text_verbosity = text_verbosity
         self.extra_body = extra_body or {}
         self.extra_headers = extra_headers or {}
 
@@ -467,6 +481,8 @@ class OpenAIResponsesLLMModel(LLMModel):
 
     def _convert_messages(self, messages: List[dict]) -> list[dict[str, Any]]:
         converted_messages: list[dict[str, Any]] = []
+        known_call_ids: set[str] = set()
+        deferred_outputs: dict[str, list[dict[str, Any]]] = {}
 
         for raw_message in messages:
             message = _model_dump_compatible(raw_message)
@@ -480,7 +496,14 @@ class OpenAIResponsesLLMModel(LLMModel):
             if role == "tool":
                 tool_output = self._convert_tool_output_message(message)
                 if tool_output:
-                    converted_messages.append(tool_output)
+                    call_id = str(tool_output["call_id"])
+                    if call_id in known_call_ids:
+                        converted_messages.append(tool_output)
+                    else:
+                        # PromptGenerator's legacy ordering can place a tool
+                        # result before its assistant call. Defer it until the
+                        # matching call so Responses receives valid history.
+                        deferred_outputs.setdefault(call_id, []).append(tool_output)
                 continue
 
             if role in {"system", "developer", "user", "assistant"} and self._has_message_content(content):
@@ -491,7 +514,25 @@ class OpenAIResponsesLLMModel(LLMModel):
                 })
 
             if role == "assistant" and tool_calls:
-                converted_messages.extend(self._convert_assistant_tool_calls(tool_calls))
+                converted_calls = self._convert_assistant_tool_calls(tool_calls)
+                for converted_call in converted_calls:
+                    converted_messages.append(converted_call)
+                    call_id = str(converted_call.get("call_id") or "")
+                    if call_id:
+                        known_call_ids.add(call_id)
+                        converted_messages.extend(deferred_outputs.pop(call_id, []))
+
+        # If truncation removed the originating call, retain the information as
+        # ordinary context instead of sending an invalid orphan tool output.
+        for call_id, outputs in deferred_outputs.items():
+            for output in outputs:
+                converted_messages.append(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": f"[Tool result for {call_id}] {output.get('output', '')}",
+                    }
+                )
 
         return converted_messages
 
@@ -561,18 +602,27 @@ class OpenAIResponsesLLMModel(LLMModel):
         params: dict[str, Any] = {
             "model": self.model_name,
             "input": self._convert_messages(messages),
-            "temperature": self.temperature,
         }
 
-        if self.model_name in ['gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-5.4', 'gpt-5.1']:
-            params["text"] = {"verbosity": "low"}
+        # Reasoning families have model/effort-specific sampling restrictions.
+        # COVAS does not need custom sampling for them, so omit temperature rather
+        # than sending a parameter that some reasoning modes reject.
+        if not _is_openai_reasoning_model(self.model_name):
+            params["temperature"] = self.temperature
+
+        if (
+            _supports_openai_text_verbosity(self.model_name)
+            and self.text_verbosity
+            and self.text_verbosity not in {"default", ""}
+        ):
+            params["text"] = {"verbosity": self.text_verbosity}
 
         if tools:
             params["tools"] = self._convert_tools(tools)
             if tool_choice:
                 params["tool_choice"] = self._convert_tool_choice(tool_choice)
 
-        if self.reasoning_effort and self.reasoning_effort not in ["disabled", "default", "none", None, ""]:
+        if self.reasoning_effort and self.reasoning_effort not in ["disabled", "default", None, ""]:
             params["reasoning"] = {"effort": self.reasoning_effort}
 
         if self.extra_body:
@@ -632,6 +682,69 @@ class OpenAIResponsesLLMModel(LLMModel):
             return [model.id for model in models]
         except Exception as e:
             raise e
+
+
+class CodexAppServerLLMModel(LLMModel):
+    """OpenAI model using Codex-managed ChatGPT OAuth without token access."""
+
+    def __init__(
+        self,
+        command: str,
+        timeout_seconds: float,
+        model_name: str,
+        reasoning_effort: Optional[str] = None,
+        text_verbosity: Optional[str] = None,
+        provider_name: str | None = None,
+    ):
+        super().__init__(model_name, provider_name=provider_name)
+        self.client = CodexAppServerClient(command, timeout_seconds)
+        self.reasoning_effort = reasoning_effort
+        self.text_verbosity = text_verbosity
+
+    def generate(self, messages: List[dict], tools: Optional[List[dict]] = None, tool_choice: Optional[Any] = None) -> tuple[str | None, List[Any] | None, ModelUsageStats]:
+        started_at = time()
+        try:
+            result = self.client.generate(
+                model=self.model_name,
+                reasoning_effort=self.reasoning_effort,
+                text_verbosity=self.text_verbosity,
+                messages=messages,
+                tools=_normalize_tools_for_chat_template(tools) if tools else None,
+                tool_choice=tool_choice,
+            )
+        except CodexAppServerError as exc:
+            raise LLMError(f"OpenAI ChatGPT OAuth error: {exc}", exc) from exc
+        except Exception as exc:
+            raise LLMError(f"OpenAI ChatGPT OAuth error: {exc}", exc) from exc
+
+        usage = ModelUsageStats(
+            input_tokens=result.usage.get("input_tokens", 0),
+            output_tokens=result.usage.get("output_tokens", 0),
+            total_tokens=result.usage.get("total_tokens", 0),
+            cached_tokens=result.usage.get("cached_tokens", 0),
+            reasoning_tokens=result.usage.get("reasoning_tokens"),
+            provider=self.provider_name,
+            model_name=self.model_name,
+            response_ms=(time() - started_at) * 1000,
+            output_chars=len(result.text) if result.text else None,
+        )
+        tool_calls = [
+            ChatCompletionMessageFunctionToolCall.model_validate(
+                {
+                    "type": "function",
+                    "id": call.get("id") or f"call_{uuid4().hex}",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": call["arguments"],
+                    },
+                }
+            )
+            for call in result.tool_calls
+        ]
+        return result.text, tool_calls or None, usage
+
+    def list_models(self) -> List[str]:
+        return ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
 
 class OpenAIEmbeddingModel(EmbeddingModel):
     def __init__(self, base_url: str, api_key: str, model_name: str, extra_headers: Optional[dict] = None, extra_body: Optional[dict] = None):
@@ -907,6 +1020,19 @@ def create_llm_model(provider: str, config: dict, prefix: str = "llm") -> LLMMod
     reasoning_effort = config.get(f"{prefix}_reasoning_effort", None)
     if reasoning_effort:
         reasoning_effort = str(reasoning_effort)
+    text_verbosity = config.get(f"{prefix}_text_verbosity", None)
+    if text_verbosity:
+        text_verbosity = str(text_verbosity)
+
+    if provider == "openai-chatgpt":
+        return CodexAppServerLLMModel(
+            command=str(config.get("codex_app_server_command", "codex")),
+            timeout_seconds=float(config.get("codex_app_server_timeout", 120)),
+            model_name=model_name,
+            reasoning_effort=reasoning_effort,
+            text_verbosity=text_verbosity,
+            provider_name=provider,
+        )
     
     if provider == "openai":
         if not base_url:
@@ -928,6 +1054,7 @@ def create_llm_model(provider: str, config: dict, prefix: str = "llm") -> LLMMod
             model_name=model_name,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
+            text_verbosity=text_verbosity,
             extra_body=extra_body,
             extra_headers=extra_headers,
             provider_name=provider,
@@ -1011,7 +1138,23 @@ def create_tts_model(provider: str, config: dict, prefix: str = "tts") -> TTSMod
     speed = float(config.get(f"{prefix}_speed", 1.0))
     voice_instructions = config.get(f"{prefix}_voice_instructions", "") or None
 
-    if provider == "openai" or provider == "custom" or provider == "local-ai-server":
+    local_model_names = {
+        "chatterbox-local": "chatterbox",
+        "qwen3-tts-local": "qwen3-tts",
+    }
+    if provider in local_model_names:
+        endpoint_key = (
+            f"{prefix}_chatterbox_endpoint"
+            if provider == "chatterbox-local"
+            else f"{prefix}_qwen3_endpoint"
+        )
+        base_url = str(config.get(endpoint_key, ""))
+        model_name = local_model_names[provider]
+        language = str(config.get(f"{prefix}_language", "en") or "en").strip().lower()
+        if config.get(f"{prefix}_append_language_to_model", True) and language:
+            model_name = f"{model_name}-{language}"
+
+    if provider in {"openai", "custom", "local-ai-server", "chatterbox-local", "qwen3-tts-local"}:
         if provider == "openai" and not base_url:
             base_url = "https://api.openai.com/v1"
         return OpenAITTSModel(

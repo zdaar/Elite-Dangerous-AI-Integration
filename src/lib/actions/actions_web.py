@@ -14,6 +14,7 @@ from ..EventManager import EventManager
 from ..Logger import log, PromptUsageStats, log_llm_usage
 from ..Models import LLMModel, EmbeddingModel
 from ..Projections import get_state_dict, ProjectedStates
+from .ExobiologyPlanner import plan_exobiology
 
 llm_model: LLMModel = cast(LLMModel, None)
 embedding_model: EmbeddingModel = cast(EmbeddingModel, None)
@@ -243,6 +244,26 @@ def web_search_agent(
         {
             "type": "function",
             "function": {
+                "name": "find_exobiology_targets",
+                "description": "Build a profit-optimized exobiology destination plan. Auto uses exact pre-Odyssey HMC body records for controller-friendly Stratum sniping with no full-system FSS; throughput explicitly uses confirmed public organisms for deterministic base-value income. Use this instead of body_finder when asked to find, replace, or optimize an exobiology money target.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "strategy": {
+                            "type": "string",
+                            "enum": ["auto", "stratum_sniping", "throughput", "first_discovery"],
+                            "description": "Use auto or stratum_sniping for the default exact-body stale-record hunt. Use throughput only for known organisms and reliable base-value income. first_discovery is an alias for stratum_sniping."
+                        },
+                        "radius": {"type": "integer", "minimum": 25, "maximum": 5000, "description": "Search radius in light years. Defaults to 500 for Stratum sniping and 50 for throughput."},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Ranked system clusters to return. Default: 8."},
+                        "max_arrival_ls": {"type": "integer", "minimum": 100, "maximum": 100000, "description": "Maximum supercruise arrival distance per candidate body. Default: 1700 ls."}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "body_finder",
                 "description": "Find a planet or star of a certain type or with a landmark.",
                 "parameters": {
@@ -315,6 +336,7 @@ def web_search_agent(
         "get_galnet_news": get_galnet_news,
         "system_finder": system_finder,
         "station_finder": station_finder,
+        "find_exobiology_targets": find_exobiology_targets,
         "body_finder": body_finder,
         "engineer_finder": engineer_finder,
         "blueprint_finder": blueprint_finder,
@@ -346,6 +368,7 @@ def web_search_agent(
     blueprint_finder lists material costs per grade, calculates missing materials from inventory, and lists capable engineers.
     engineer_finder reports unlock status (known/invited/unlocked), rank progress, and workshop locations.
     station_finder can locate Material Traders and Technology Brokers. body_finder finds biological signals and mining hotspots.
+    When the user asks to find, replace, or optimize an exobiology money destination, call find_exobiology_targets first and only once. Do not approximate targets with body_finder. Use strategy auto unless the user explicitly asks for a public confirmed-organism route, in which case use throughput. Auto means exact pre-Odyssey Stratum leads with possible, never guaranteed, First Logged payout. Preserve navigation_instruction verbatim and tell the parent assistant to call plotToTarget immediately. Label distance_ly as distance from the planning source, not live current distance. The target's targeted_fss_bodies are the only bodies to resolve; never recommend a 100% or full-system FSS. Do not call this planner for current target/route/queue status, organisms already shown on the current body, sampling guidance, or a direct ship/navigation command. Do not fall back to a web search or body_finder when this one call returns no target; report the limitation.
 
     Here are some examples of how to use the tools:
 
@@ -2689,6 +2712,17 @@ def body_finder(obj, projected_states):
         return format_web_request_error("body finder", e, response)
 
 
+def find_exobiology_targets(obj, projected_states):
+    try:
+        plan = plan_exobiology(obj, projected_states)
+        if not plan.get("recommended_target"):
+            return "No profitable exobiology targets were found in the selected radius. Increase radius and retry once."
+        return json.dumps(plan, ensure_ascii=False)
+    except Exception as e:
+        log('error', e, traceback.format_exc())
+        return format_web_request_error("exobiology planner", e, getattr(e, "response", None))
+
+
 def register_web_actions(actionManager: ActionManager, eventManager: EventManager, 
                         promptGenerator: PromptGenerator,
                          llmModel: LLMModel | None,
@@ -2700,6 +2734,42 @@ def register_web_actions(actionManager: ActionManager, eventManager: EventManage
     llm_model = cast(LLMModel, llmModel)
     embedding_model = cast(EmbeddingModel, embeddingModel)
     agent_max_tries = agentMaxTries
+
+    actionManager.registerAction(
+        'find_exobiology_targets',
+        "Find and rank profitable exobiology destinations from the live planning position and ship jump range. Use immediately and once when asked to find, replace, or optimize a money target. Auto mines exact pre-Odyssey HMC body records, clusters multiple candidates per system, avoids full-system FSS, and treats First Logged as a heuristic rather than a guarantee. Throughput uses public confirmed organisms for base-value certainty. After success, call plotToTarget with navigation_instruction unless the user asked for information only, then verify the live route destination separately. Returned distance_ly is distance from the planning source; it is not a live remaining-distance counter. Do not call web_search_agent, body_finder, or a guide lookup first or as a fallback. Do not use this action for current route/queue status, direct navigation, or current-body sampling guidance.",
+        {
+            "type": "object",
+            "properties": {
+                "strategy": {
+                    "type": "string",
+                    "enum": ["auto", "stratum_sniping", "throughput", "first_discovery"],
+                    "description": "auto/stratum_sniping is the default exact-body legacy-record method; throughput is a confirmed public-organism route; first_discovery is an alias for stratum_sniping."
+                },
+                "radius": {
+                    "type": "integer",
+                    "minimum": 25,
+                    "maximum": 5000,
+                    "description": "Search radius in light years. Omit for the efficient strategy default."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Number of ranked system clusters. Default: 8."
+                },
+                "max_arrival_ls": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 100000,
+                    "description": "Maximum candidate-body arrival distance. Default: 1700 ls."
+                }
+            }
+        },
+        find_exobiology_targets,
+        'web',
+        input_template=lambda i, s: "Optimizing exobiology targets",
+    )
 
     actionManager.registerAction(
         'web_search_agent',

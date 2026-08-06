@@ -344,6 +344,46 @@
         <p>The action cache allows the AI to learn from previous interactions and reuse actions for similar
             inputs, making responses faster and more consistent.</p>
         <h2>Quality of Life</h2>
+        <mat-slide-toggle [ngModel]="config.qol_non_kgbfoam_jump_warning"
+                          (ngModelChange)="onConfigChange({qol_non_kgbfoam_jump_warning: $event})">
+            Warn before non-KGBFOAM jumps
+        </mat-slide-toggle>
+        <p>Calmly identifies the immediate destination star when hyperspace charging begins. Classification and wording are local and deterministic.</p>
+        <mat-slide-toggle [ngModel]="config.qol_non_kgbfoam_unknown_warning"
+                          (ngModelChange)="onConfigChange({qol_non_kgbfoam_unknown_warning: $event})"
+                          [disabled]="!config.qol_non_kgbfoam_jump_warning">
+            Warn when the next star class is unknown
+        </mat-slide-toggle>
+        <p>Optional. Nova will say that the class is unknown without guessing it.</p>
+        <mat-slide-toggle [ngModel]="config.route_safety_close_star_enabled"
+                          (ngModelChange)="onConfigChange({route_safety_close_star_enabled: $event})">
+            Avoid known dangerous close-star destinations
+        </mat-slide-toggle>
+        <p>Before exobiology navigation, Nova checks exact catalogue geometry locally and excludes only proven dangerous destinations. Elite still controls intermediate route hops.</p>
+        <mat-slide-toggle [ngModel]="config.route_safety_cancel_dangerous_charge"
+                          (ngModelChange)="onConfigChange({route_safety_cancel_dangerous_charge: $event})"
+                          [disabled]="!config.route_safety_close_star_enabled">
+            Cancel jumps into proven dangerous systems
+        </mat-slide-toggle>
+        <p>Nova validates plotted hops, shortens unsafe routes to the last safe system, tries a scoopable intermediate, and rechecks the original route. If geometry is unavailable she warns before using an unknown bypass. Supercruise is never affected.</p>
+        <mat-form-field appearance="fill">
+            <mat-label>Unknown star geometry</mat-label>
+            <mat-select [ngModel]="config.route_safety_unknown_system_policy"
+                        (ngModelChange)="onConfigChange({route_safety_unknown_system_policy: $event})"
+                        [disabled]="!config.route_safety_close_star_enabled">
+                <mat-option value="allow">Allow (recommended)</mat-option>
+                <mat-option value="exclude">Exclude</mat-option>
+            </mat-select>
+        </mat-form-field>
+        <p>Allow keeps unexplored and incompletely catalogued space routeable. Exclude is stricter and can leave no destination.</p>
+        <mat-form-field appearance="fill">
+            <mat-label>Close-star surface-gap ratio</mat-label>
+            <input matInput type="number" min="0" max="5" step="0.25"
+                   [ngModel]="config.route_safety_max_surface_gap_ratio"
+                   (ngModelChange)="onConfigChange({route_safety_max_surface_gap_ratio: $event})"
+                   [disabled]="!config.route_safety_close_star_enabled">
+        </mat-form-field>
+        <p>1.0 excludes a pair when its minimum empty gap is no larger than the two stellar radii combined. This is a conservative geometry rule, not a ship-specific heat prediction.</p>
         <mat-slide-toggle [ngModel]="config.qol_autobrake"
                             (ngModelChange)="onConfigChange({qol_autobrake: $event})">
             Auto Brake

@@ -1,8 +1,11 @@
 from hashlib import md5
 from collections.abc import Iterator
+from dataclasses import dataclass
 import json
 import random
+import re
 from typing import Any, Callable, Literal
+import unicodedata
 
 from openai.types.chat import ChatCompletionMessageFunctionToolCall
 from pydantic import BaseModel
@@ -16,7 +19,87 @@ import traceback
 ProjectedStates = dict[str, BaseModel]
 
 
+@dataclass(frozen=True)
+class ActionRoutingDecision:
+    action: ChatCompletionMessageFunctionToolCall | None
+    reason: str | None = None
+    cacheable: bool = True
+
+
 class ActionManager:
+    _MANAGED_GUIDE_ACTIONS = {
+        "lookup_elite_guide",
+    }
+    _EXTERNAL_LOOKUP_ACTIONS = {
+        "web_search_agent",
+        "remember_memories",
+    }
+    _LOOKUP_ACTIONS = _MANAGED_GUIDE_ACTIONS | _EXTERNAL_LOOKUP_ACTIONS
+    _EXPEDITION_REPLACEMENT_ACTIONS = {
+        "find_exobiology_targets",
+        "plan_tectonicas_expedition",
+    }
+
+    _CURRENT_CONTEXT_PATTERNS = tuple(re.compile(pattern) for pattern in (
+        r"\bguide moi\b",
+        r"\bguide me\b",
+        r"\bwhat (?:do i do )?now\b",
+        r"\bwhat next\b",
+        r"\bque faire\b",
+        r"\bquoi faire\b",
+        r"\bqu est ce que je fais\b",
+        r"\b(?:where|ou)\b.{0,30}\b(?:land|atterrir|look|chercher)\b",
+        r"\b(?:how|comment)\b.{0,30}\b(?:find|trouver|scan|scanner|sample|echantillon)\b",
+        r"\b(?:current|actuel|actuelle)\b.{0,12}\b(?:body|corps|planet|planete|target|cible)\b",
+        r"\b(?:status|statut|progress|progression)\b.{0,24}\b(?:route|navigation|expedition|file|queue|index|target|cible|body|corps|planet|planete)\b",
+        r"\b(?:route|navigation|expedition|file|queue|index|target|cible|body|corps|planet|planete)\b.{0,24}\b(?:status|statut|progress|progression)\b",
+        r"\b(?:my|mon|ma|mes|our|notre)\b.{0,16}\b(?:status|statut|progress|progression)\b",
+        r"\b(?:what|quel|quelle)\b.{0,12}\bindex\b",
+    ))
+
+    _CURRENT_BODY_DIRECT_PATTERNS = tuple(re.compile(pattern) for pattern in (
+        r"\bguide moi\b.{0,60}\b(?:ici|sur ce|dans ce|dans le systeme|corps|planete)\b",
+        r"\bguide me\b.{0,60}\b(?:here|on this|in this|body|planet|system)\b",
+        r"\bwhat (?:do i do )?now\b",
+        r"\bwhat next\b",
+        r"\bque faire\b",
+        r"\bquoi faire\b",
+        r"\bqu est ce que je fais\b",
+        r"\b(?:current|actuel|actuelle)\b.{0,12}\b(?:body|corps|planet|planete|target|cible)\b",
+        r"\b(?:status|statut|progress|progression)\b.{0,24}\b(?:route|navigation|expedition|file|queue|index|target|cible|body|corps|planet|planete)\b",
+        r"\b(?:route|navigation|expedition|file|queue|index|target|cible|body|corps|planet|planete)\b.{0,24}\b(?:status|statut|progress|progression)\b",
+        r"\b(?:my|mon|ma|mes|our|notre)\b.{0,16}\b(?:status|statut|progress|progression)\b",
+        r"\b(?:what|quel|quelle)\b.{0,12}\bindex\b",
+    ))
+
+    _EXPLICIT_ADVANCE_PATTERNS = tuple(re.compile(pattern) for pattern in (
+        r"^(?:nova\s+)?(?:operation\s+)?next(?:\s+(?:target|cible))?$",
+        r"^(?:nova\s+)?(?:expedition\s+next|next\s+system|systeme\s+suivant)$",
+        r"^(?:nova\s+)?(?:skip|advance)$",
+        r"\boperation\s+next\b",
+        r"\b(?:next target|prochaine cible|cible suivante|next system|systeme suivant)\b",
+        r"\b(?:advance|avance|skip|saute|abandonne)\b.{0,30}\b(?:target|cible|body|corps|system|systeme|queue|file)\b",
+        r"\b(?:nothing|rien)(?:\s+is)?\s+(?:here|ici)\b",
+        r"\b(?:done|finished|complete|termine|fini)\s+(?:here|ici)\b",
+    ))
+
+    _EXPLICIT_REPLAN_PATTERNS = tuple(re.compile(pattern) for pattern in (
+        r"\b(?:create|build|plan|replan|cree|construis|planifie|replanifie|refais)\b.{0,40}\b(?:expedition|route|queue|file|target|cible)\b",
+        r"\b(?:find|cherche|trouve)\b.{0,40}\b(?:profitable|rentable|money|credit|credits|tectonicas|stratum)\b",
+        r"\b(?:new|nouveau|nouvelle|remplace|replace)\b.{0,24}\b(?:target|cible|expedition|route|queue|file)\b",
+    ))
+
+    _DIRECT_REQUEST_PATTERNS = tuple(re.compile(pattern) for pattern in (
+        r"\b(?:call|appelle|use|utilise|execute)\b.{0,50}\b(?:tool|outil|action)\b",
+        r"^(?:nova\s+)?(?:plot|replot|trace|retrace|ouvre|open|ferme|close|selectionne|select|definis|set|mets|reset|reinitialise)\b",
+        r"\b(?:plot|replot|trace|retrace)\b.{0,40}\b(?:route|systeme|system|cible|target)\b",
+        r"\b(?:how many|combien de)\b.{0,16}\b(?:jump|jumps|saut|sauts)\b",
+        r"\b(?:where am i|ou suis je|systeme actuel|current system|cible actuelle|current target)\b",
+        r"\b(?:statut|status)\b.{0,20}\b(?:route|navigation|expedition|file|queue|index)\b",
+        r"\b(?:operation|index)\b.{0,20}\b(?:start|status|next|previous|reset|set|demarre|suivant|precedent)\b",
+        r"\b(?:expedition next|next system|systeme suivant)\b",
+    ))
+
     @staticmethod
     def clear_action_cache():
         """clear action cache"""
@@ -28,6 +111,121 @@ class ActionManager:
     def __init__(self):
         self.action_cache = KeyValueStore("action_cache")
         self.allowed_actions: dict[str, bool] = {}
+
+    @staticmethod
+    def _normalize_routing_text(value: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", str(value or ""))
+        without_accents = "".join(char for char in decomposed if not unicodedata.combining(char))
+        return " ".join(re.sub(r"[^a-z0-9_]+", " ", without_accents.casefold()).split())
+
+    @classmethod
+    def _matches_any(cls, text: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+        return any(pattern.search(text) for pattern in patterns)
+
+    @classmethod
+    def _explicitly_requests_action(cls, text: str, action_name: str) -> bool:
+        compact_text = text.replace("_", "").replace(" ", "")
+        compact_name = cls._normalize_routing_text(action_name).replace("_", "").replace(" ", "")
+        if compact_name and compact_name in compact_text:
+            return True
+        if action_name == "web_search_agent":
+            return bool(re.search(r"\b(?:web search|search the web|recherche web|cherche sur le web)\b", text))
+        if action_name == "remember_memories":
+            return bool(re.search(r"\b(?:memory search|search memor|recherche memoire|cherche.*memoire)\b", text))
+        if action_name == "lookup_elite_guide":
+            return bool(re.search(r"\b(?:lookup|consulte|consult)\b.{0,24}\b(?:guide|doc)\b", text))
+        return False
+
+    @classmethod
+    def _is_direct_request(cls, text: str, sibling_action_names: set[str]) -> bool:
+        if any(name not in cls._LOOKUP_ACTIONS for name in sibling_action_names):
+            return True
+        compact_text = text.replace("_", "").replace(" ", "")
+        for action_name in cls.actions:
+            if action_name in cls._LOOKUP_ACTIONS:
+                continue
+            compact_name = cls._normalize_routing_text(action_name).replace("_", "").replace(" ", "")
+            if compact_name and compact_name in compact_text:
+                return True
+        return (
+            cls._matches_any(text, cls._DIRECT_REQUEST_PATTERNS)
+            or cls._matches_any(text, cls._CURRENT_BODY_DIRECT_PATTERNS)
+        )
+
+    @classmethod
+    def guard_action(
+        cls,
+        action: ChatCompletionMessageFunctionToolCall,
+        latest_user_input: str,
+        sibling_action_names: set[str] | None = None,
+    ) -> ActionRoutingDecision:
+        """Apply deterministic safety rules to model-selected actions.
+
+        The model still chooses normal tools. This guard only neutralizes two
+        known destructive routing mistakes: advancing or replacing an
+        exobiology queue in response to local guidance, and doing a
+        preliminary lookup before an explicit action or live-status request.
+        """
+        text = cls._normalize_routing_text(latest_user_input)
+        action_name = action.function.name
+        sibling_names = sibling_action_names or {action_name}
+
+        if action_name == "control_exobiology_expedition":
+            try:
+                arguments = json.loads(action.function.arguments or "{}")
+            except (TypeError, ValueError):
+                arguments = {}
+            if (
+                isinstance(arguments, dict)
+                and arguments.get("operation") == "next"
+                and cls._matches_any(text, cls._CURRENT_CONTEXT_PATTERNS)
+                and not cls._matches_any(text, cls._EXPLICIT_ADVANCE_PATTERNS)
+            ):
+                guarded_action = action.model_copy(deep=True)
+                guarded_arguments = dict(arguments)
+                guarded_arguments["operation"] = "status"
+                guarded_action.function.arguments = json.dumps(guarded_arguments, ensure_ascii=False)
+                return ActionRoutingDecision(
+                    action=guarded_action,
+                    reason="current-body guidance cannot advance the expedition; converted next to status",
+                    cacheable=False,
+                )
+
+        if (
+            action_name in cls._EXPEDITION_REPLACEMENT_ACTIONS
+            and cls._matches_any(text, cls._CURRENT_CONTEXT_PATTERNS)
+            and not cls._matches_any(text, cls._EXPLICIT_REPLAN_PATTERNS)
+            and not cls._explicitly_requests_action(text, action_name)
+        ):
+            return ActionRoutingDecision(
+                action=None,
+                reason="current-body guidance cannot create or replace expedition targets",
+                cacheable=False,
+            )
+
+        if (
+            action_name in cls._LOOKUP_ACTIONS
+            and cls._is_direct_request(text, sibling_names)
+            and not cls._explicitly_requests_action(text, action_name)
+        ):
+            return ActionRoutingDecision(
+                action=None,
+                reason="preliminary lookup blocked for an explicit action or live-status request",
+                cacheable=False,
+            )
+
+        if (
+            action_name in cls._EXTERNAL_LOOKUP_ACTIONS
+            and bool(sibling_names & cls._MANAGED_GUIDE_ACTIONS)
+            and not cls._explicitly_requests_action(text, action_name)
+        ):
+            return ActionRoutingDecision(
+                action=None,
+                reason="external lookup blocked because the managed Elite guide is authoritative",
+                cacheable=False,
+            )
+
+        return ActionRoutingDecision(action=action)
 
     def set_allowed_actions(self, allowed_actions: dict[str, bool] | None):
         """Set enabled states by permission key. Missing keys are disabled."""

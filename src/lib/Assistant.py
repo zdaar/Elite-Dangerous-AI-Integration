@@ -241,8 +241,6 @@ class Assistant:
                 glitch["min_seconds"] = float(glitch["min_seconds"]) * intensity
             if isinstance(glitch.get("max_seconds"), (int, float)):
                 glitch["max_seconds"] = float(glitch["max_seconds"]) * intensity
-            if isinstance(glitch.get("detune_base"), (int, float)):
-                glitch["detune_base"] = float(glitch["detune_base"]) * intensity
             if isinstance(glitch.get("detune_peak"), (int, float)):
                 glitch["detune_peak"] = float(glitch["detune_peak"]) * intensity
 
@@ -789,10 +787,47 @@ class Assistant:
 
 
     @observe()
-    def execute_actions(self, actions: list[ChatCompletionMessageToolCall], projected_states: ProjectedStates):
+    def execute_actions(
+        self,
+        actions: list[ChatCompletionMessageToolCall],
+        projected_states: ProjectedStates,
+        latest_user_input: str = "",
+    ) -> list[ChatCompletionMessageToolCall]:
         action_descriptions: list[str | None] = []
         action_results: list[Any] = []
-        for action in actions:
+        cacheable_actions: list[ChatCompletionMessageToolCall] = []
+        sibling_action_names = {action.function.name for action in actions}
+        for requested_action in actions:
+            routing = self.action_manager.guard_action(
+                requested_action,
+                latest_user_input,
+                sibling_action_names,
+            )
+            if routing.action is None:
+                log("warn", f"Tool routing guard blocked {requested_action.function.name}: {routing.reason}")
+                action_result = {
+                    "tool_call_id": requested_action.id,
+                    "role": "tool",
+                    "name": requested_action.function.name,
+                    "content": json.dumps({
+                        "success": False,
+                        "blocked": True,
+                        "reason": routing.reason,
+                        "instruction": (
+                            "Do not retry this blocked action. Use live state or call the explicitly requested direct action."
+                        ),
+                    }, ensure_ascii=False),
+                }
+                action_results.append(action_result)
+                action_descriptions.append(None)
+                self.event_manager.add_tool_call([requested_action.model_dump()], [action_result], None)
+                continue
+
+            action = routing.action
+            if routing.reason:
+                log("warn", f"Tool routing guard adjusted {requested_action.function.name}: {routing.reason}")
+            if routing.cacheable:
+                cacheable_actions.append(action)
             action_input_desc = self.action_manager.getActionDesc(action, projected_states)
             action_descriptions.append(action_input_desc)
             if action_input_desc:
@@ -814,6 +849,16 @@ class Assistant:
             action_results.append(action_result)
 
             self.event_manager.add_tool_call([action.model_dump()], [action_result], [action_input_desc] if action_input_desc else None)
+
+        return cacheable_actions
+
+
+    def _action_cache_enabled(self) -> bool:
+        """Avoid duplicate model calls while Codex is waiting for a tool result."""
+        return (
+            bool(self.config.get("use_action_cache_var", False))
+            and self.config.get("llm_provider") != "openai-chatgpt"
+        )
 
 
     def verify_action(self, user_input: str, action: ChatCompletionMessageToolCall, prompt: list, tools: list):
@@ -862,6 +907,11 @@ class Assistant:
             events = self.event_manager.get_short_term_memory(150)
             events = list(reversed(events))
             new_events = [event for event in events if event.responded_at == None]
+            latest_user_input = next((
+                event.content
+                for event in reversed(events)
+                if isinstance(event, ConversationEvent) and event.kind == 'user'
+            ), "")
             self.pending = []
             
             memories = self.event_manager.get_latest_memories(limit=5)
@@ -905,7 +955,8 @@ class Assistant:
             allowed_actions = self.config.get("allowed_actions", {})
             tool_list = self.action_manager.getToolsList(active_mode, uses_actions, uses_web_actions, uses_ui_actions, allowed_actions) if use_tools else None
             predicted_actions = None
-            if tool_list and user_input and not tool_uses and self.config["use_action_cache_var"]:
+            use_action_cache = self._action_cache_enabled()
+            if tool_list and user_input and not tool_uses and use_action_cache:
                 predicted_actions = self.action_manager.predict_action(user_input[-1], tool_list)
                 
             if predicted_actions:
@@ -951,11 +1002,15 @@ class Assistant:
 
             if response_actions:
                 self.event_manager.add_assistant_acting(processed_at=max_conversation_processed)
-                self.execute_actions(response_actions, projected_states)
+                cacheable_actions = self.execute_actions(
+                    response_actions,
+                    projected_states,
+                    latest_user_input,
+                )
 
-                if not predicted_actions and self.config["use_action_cache_var"] and tool_list:
-                    if len(response_actions) == 1 and len(user_input):
-                        self.verify_action(user_input[-1], response_actions[0], prompt, tool_list)
+                if not predicted_actions and use_action_cache and tool_list:
+                    if len(cacheable_actions) == 1 and len(user_input):
+                        self.verify_action(user_input[-1], cacheable_actions[0], prompt, tool_list)
                     
         except Exception as e:
             log("debug", "LLM error during reply:", e, traceback.format_exc())

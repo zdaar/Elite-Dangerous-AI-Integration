@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   confirmWindowClose: () => ipcRenderer.invoke('window-close-ready'),
   userAssets: {
     writeFile: (opts) => ipcRenderer.invoke('write_user_asset_file', opts),
+    getFileInfo: (opts) => ipcRenderer.invoke('get_user_asset_file_info', opts),
     readFile: (opts) => ipcRenderer.invoke('read_user_asset_file', opts),
     listFiles: () => ipcRenderer.invoke('list_user_asset_files'),
     deleteFile: (opts) => ipcRenderer.invoke('delete_user_asset_file', opts),

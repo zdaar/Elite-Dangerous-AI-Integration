@@ -213,6 +213,16 @@ class SystemDatabase:
             log('error', f"Error getting system by address {star_address}: {e}")
             return None
 
+    def get_cached_system_info(self, system_name: str) -> Dict[str, Any]:
+        """Return cached system data without triggering any network request."""
+        try:
+            record = self._get_system_record(system_name)
+            system_info = record.get('system_info') if record else None
+            return system_info if isinstance(system_info, dict) else {}
+        except Exception as e:
+            log('error', f"Error reading cached system info for {system_name}: {e}")
+            return {}
+
     def has_system(self, system_name: str) -> bool:
         """Return True if we already have a record for the system name."""
         try:
@@ -366,6 +376,10 @@ class SystemDatabase:
                 body_entry["timestamp"] = timestamp
             if parents is not None:
                 body_entry["parents"] = parents
+            # Preserve the authoritative intra-system geometry needed by local
+            # route-safety classification. This is additive and does not
+            # disturb existing EDSM-shaped fields or exploration state.
+            body_entry["journal_scan"] = dict(event)
 
         self._with_system_info(system_name, system_address, updater)
 
