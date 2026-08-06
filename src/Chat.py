@@ -95,6 +95,24 @@ from lib.NonKgbfoamJumpWarning import (
     format_star_warning,
     format_unknown_class_warning,
 )
+from lib.CloseStarJumpGuard import (
+    CloseStarJumpGuardController,
+    format_close_star_guard_warning,
+    format_unsafe_plotted_route_warning,
+)
+from lib.RouteBypassPlanner import find_verified_safe_bypass
+from lib.RouteSafety import (
+    ROUTE_SAFETY_CACHE,
+    RouteSafetyPolicy,
+    SystemSafetyAssessment,
+    assess_star_system,
+    route_safety_policy_from_config,
+    star_geometry_from_edsm,
+    star_geometry_from_journal,
+)
+from lib.RouteSafetyProvider import prefetch_spansh_systems_nonblocking
+from lib.RouteSafetySupervisor import RouteHop, RouteSafetySupervisor, SupervisorDecision
+from lib.Screenshot import set_game_window_active
 
 
 def get_model_usage_history_payload(
@@ -413,6 +431,10 @@ class Chat:
 
         self.previous_states = {}
         self.non_kgbfoam_jump_warning = NonKgbfoamJumpWarningController()
+        self.close_star_jump_guard = CloseStarJumpGuardController()
+        self.route_safety_supervisor = RouteSafetySupervisor()
+        self._route_safety_lock = threading.RLock()
+        self._route_safety_generation = 0
 
     def emit_runtime_state(self):
         _, projected_states = self.event_manager.get_current_state()
@@ -466,8 +488,361 @@ class Chat:
             on_complete=on_complete,
         )
 
+    def _route_safety_policy(self) -> RouteSafetyPolicy:
+        return route_safety_policy_from_config(cast(dict[str, Any], self.config))
+
+    @staticmethod
+    def _route_hops(route: object) -> list[RouteHop]:
+        if not isinstance(route, list):
+            return []
+        hops: list[RouteHop] = []
+        for entry in route:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("StarSystem") or "").strip()
+            if not name:
+                continue
+            address = entry.get("SystemAddress")
+            if not isinstance(address, int) or isinstance(address, bool):
+                address = None
+            raw_position = entry.get("StarPos")
+            coordinates = None
+            if (
+                isinstance(raw_position, list)
+                and len(raw_position) >= 3
+                and all(isinstance(value, (int, float)) for value in raw_position[:3])
+            ):
+                coordinates = tuple(float(value) for value in raw_position[:3])
+            hops.append(RouteHop(name, address, coordinates))
+        return hops
+
+    def _speak_route_safety_message(
+        self,
+        text: str,
+        projected_states: dict[str, Any],
+    ) -> None:
+        show_chat_message("covas", text)
+
+        def on_start() -> None:
+            self.event_manager.add_assistant_speaking()
+
+        def on_complete() -> None:
+            if not self.tts.has_queued_items():
+                self.event_manager.add_assistant_complete_event()
+
+        self.tts.say(
+            text,
+            context="route_safety",
+            postprocessing_layers=self.assistant._get_tts_postprocessing_layers(
+                cast(Any, projected_states)
+            ),
+            on_start=on_start,
+            on_complete=on_complete,
+        )
+
+    def _lookup_route_safety_assessment(
+        self,
+        system_address: int,
+    ) -> SystemSafetyAssessment | None:
+        policy = self._route_safety_policy()
+        cached = ROUTE_SAFETY_CACHE.get(system_address, policy)
+        if cached is not None:
+            return cached
+        record = self.system_database.get_system_by_address(system_address)
+        if not isinstance(record, dict):
+            return None
+        system_info = record.get("system_info")
+        bodies = system_info.get("bodies") if isinstance(system_info, dict) else None
+        if not isinstance(bodies, list) or not bodies:
+            return None
+        stars = []
+        for body in bodies:
+            if not isinstance(body, dict):
+                continue
+            journal_scan = body.get("journal_scan")
+            star = (
+                star_geometry_from_journal(journal_scan)
+                if isinstance(journal_scan, dict)
+                else star_geometry_from_edsm(body)
+            )
+            if star is not None:
+                stars.append(star)
+        if not stars:
+            return None
+        assessment = assess_star_system(
+            str(record.get("name") or "Unknown system"),
+            stars,
+            policy,
+            system_id64=system_address,
+        )
+        ROUTE_SAFETY_CACHE.put(assessment, policy)
+        return assessment
+
+    def _plot_supervised_system(
+        self,
+        target: RouteHop | None,
+        projected_states: dict[str, Any],
+    ) -> bool:
+        if target is None:
+            return False
+        descriptor = self.action_manager.actions.get("plotToTarget")
+        if not descriptor:
+            return False
+        try:
+            result = str(descriptor["method"]({"system": target.name}, projected_states))
+        except Exception:
+            return False
+        lowered = result.casefold()
+        return "successfully plotted" in lowered or "already set" in lowered or "already in" in lowered
+
+    def _manual_bypass_warning(
+        self,
+        reason: str,
+        projected_states: dict[str, Any],
+    ) -> None:
+        language = configured_warning_language(cast(dict[str, object], self.config))
+        text = (
+            f"Contournement automatique interrompu : {reason} Trace manuellement un système KGBFOAM sûr autour du danger."
+            if language == "fr"
+            else f"Automatic bypass stopped: {reason} Plot a known-safe KGBFOAM system around the hazard manually."
+        )
+        self._speak_route_safety_message(text, projected_states)
+
+    def _find_and_plot_bypass(self, projected_states: dict[str, Any]) -> None:
+        with self._route_safety_lock:
+            boundary = self.route_safety_supervisor.boundary
+            dangerous = self.route_safety_supervisor.dangerous
+            destination = self.route_safety_supervisor.original_destination
+            forbidden = set(self.route_safety_supervisor.forbidden_system_ids)
+        if boundary is None or dangerous is None or destination is None:
+            self._manual_bypass_warning("route state is incomplete.", projected_states)
+            return
+        ship = projected_states.get("ShipInfo")
+        ship_dict = ship.model_dump() if hasattr(ship, "model_dump") else ship
+        jump_range = 0.0
+        if isinstance(ship_dict, dict):
+            for field in ("CurrentJumpRange", "MaximumJumpRange", "ReportedMaximumJumpRange"):
+                value = ship_dict.get(field)
+                if isinstance(value, (int, float)) and value > 0:
+                    jump_range = float(value)
+                    break
+        candidate, error = find_verified_safe_bypass(
+            boundary,
+            dangerous,
+            destination,
+            jump_range,
+            forbidden,
+            self._route_safety_policy(),
+        )
+        if candidate is None:
+            with self._route_safety_lock:
+                self.route_safety_supervisor.require_manual_bypass()
+            self._manual_bypass_warning(error or "no verified-safe waypoint was found.", projected_states)
+            return
+        with self._route_safety_lock:
+            self.route_safety_supervisor.set_bypass(candidate.hop)
+        language = configured_warning_language(cast(dict[str, object], self.config))
+        if candidate.safety_status == "safe":
+            text = (
+                f"Replanification vers l'intermédiaire KGBFOAM vérifié {candidate.hop.name}, à {candidate.jump_distance_ly:.2f} années-lumière."
+                if language == "fr"
+                else f"Replotting to verified-safe KGBFOAM intermediate {candidate.hop.name}, {candidate.jump_distance_ly:.2f} light-years away."
+            )
+        else:
+            text = (
+                f"Aucun intermédiaire prouvé sûr. Je tente {candidate.hop.name}, une étoile KGBFOAM à {candidate.jump_distance_ly:.2f} années-lumière, mais sa géométrie stellaire est inconnue. Prudence."
+                if language == "fr"
+                else f"No positively safe intermediate was found. I am trying {candidate.hop.name}, a KGBFOAM star {candidate.jump_distance_ly:.2f} light-years away, but its companion geometry is unknown. Use caution."
+            )
+        self._speak_route_safety_message(text, projected_states)
+        if not self._plot_supervised_system(candidate.hop, projected_states):
+            with self._route_safety_lock:
+                self.route_safety_supervisor.require_manual_bypass()
+            self._manual_bypass_warning("the intermediate route could not be plotted.", projected_states)
+
+    def _execute_supervisor_decision(
+        self,
+        decision: SupervisorDecision,
+        projected_states: dict[str, Any],
+    ) -> None:
+        language = configured_warning_language(cast(dict[str, object], self.config))
+        if decision.action == "route_safe":
+            text = "Route vérifiée sûre." if language == "fr" else "Route verified safe."
+            self._speak_route_safety_message(text, projected_states)
+            return
+        if decision.action == "route_accepted_unknown":
+            text = (
+                f"Route acceptée avec {decision.unknown_hops} système{'s' if decision.unknown_hops != 1 else ''} dont la géométrie stellaire est inconnue."
+                if language == "fr"
+                else f"Route accepted with {decision.unknown_hops} system{'s' if decision.unknown_hops != 1 else ''} whose close-star geometry is unknown."
+            )
+            self._speak_route_safety_message(text, projected_states)
+            return
+        if decision.action == "plot_boundary":
+            text = format_unsafe_plotted_route_warning(
+                decision.dangerous.name if decision.dangerous else "Unknown",
+                decision.target.name if decision.target else "Unknown",
+                decision.hop_number or 1,
+                language,
+            )
+            self._speak_route_safety_message(text, projected_states)
+            if not self._plot_supervised_system(decision.target, projected_states):
+                with self._route_safety_lock:
+                    self.route_safety_supervisor.require_manual_bypass()
+                self._manual_bypass_warning("the safe-prefix route could not be plotted.", projected_states)
+            return
+        if decision.action == "find_bypass":
+            if decision.dangerous is not None:
+                self._speak_route_safety_message(
+                    format_unsafe_plotted_route_warning(
+                        decision.dangerous.name,
+                        decision.target.name if decision.target else "current system",
+                        decision.hop_number or 1,
+                        language,
+                    ),
+                    projected_states,
+                )
+            self._find_and_plot_bypass(projected_states)
+            return
+        if decision.action == "plot_original":
+            text = (
+                "Intermédiaire atteint. Replanification vers la destination d'origine et nouvelle vérification."
+                if language == "fr"
+                else "Intermediate reached. Replotting the original destination and checking the route again."
+            )
+            self._speak_route_safety_message(text, projected_states)
+            if not self._plot_supervised_system(decision.target, projected_states):
+                with self._route_safety_lock:
+                    self.route_safety_supervisor.require_manual_bypass()
+                self._manual_bypass_warning("the original destination could not be replotted.", projected_states)
+            return
+        if decision.action == "manual_bypass_required":
+            self._manual_bypass_warning(decision.message, projected_states)
+
+    def _handle_route_safety_prefetch(
+        self,
+        event: Event,
+        projected_states: dict[str, Any],
+    ) -> None:
+        if not isinstance(event, GameEvent):
+            return
+        policy = self._route_safety_policy()
+        if not policy.enabled:
+            return
+        event_name = event.content.get("event")
+        if event_name == "NavRoute":
+            route = self._route_hops(event.content.get("Route"))
+            if len(route) < 2:
+                return
+            systems = {
+                hop.system_address: hop.name
+                for hop in route[1:]
+                if hop.system_address is not None
+            }
+            with self._route_safety_lock:
+                self._route_safety_generation += 1
+                generation = self._route_safety_generation
+
+            def on_complete(_assessments, _error) -> None:
+                with self._route_safety_lock:
+                    if generation != self._route_safety_generation:
+                        return
+                    decision = self.route_safety_supervisor.inspect_route(
+                        route,
+                        self._lookup_route_safety_assessment,
+                    )
+                self._execute_supervisor_decision(decision, projected_states)
+
+            prefetch_spansh_systems_nonblocking(
+                systems,
+                policy,
+                on_complete=on_complete,
+            )
+        elif event_name == "FSDTarget":
+            address = event.content.get("SystemAddress")
+            name = str(event.content.get("Name") or "").strip()
+            if isinstance(address, int) and name:
+                prefetch_spansh_systems_nonblocking({address: name}, policy)
+
+    def _handle_close_star_jump_guard(
+        self,
+        event: Event,
+        projected_states: dict[str, Any],
+    ) -> None:
+        enabled = bool(self.config.get("route_safety_close_star_enabled", True)) and bool(
+            self.config.get("route_safety_cancel_dangerous_charge", True)
+        )
+        decision = self.close_star_jump_guard.process(
+            event,
+            enabled=enabled,
+            lookup=self._lookup_route_safety_assessment,
+        )
+        if decision is None:
+            return
+        cancelled = False
+        try:
+            set_game_window_active()
+            self.ed_keys.send("Hyperspace")
+            cancelled = True
+        except Exception:
+            cancelled = False
+        language = configured_warning_language(cast(dict[str, object], self.config))
+        self._speak_route_safety_message(
+            format_close_star_guard_warning(
+                decision,
+                language,
+                cancelled=cancelled,
+            ),
+            projected_states,
+        )
+
+    def _warn_if_next_route_hop_is_unmapped(
+        self,
+        projected_states: dict[str, Any],
+    ) -> None:
+        if not self._route_safety_policy().enabled:
+            return
+        nav_info = projected_states.get("NavInfo")
+        nav_dict = nav_info.model_dump() if hasattr(nav_info, "model_dump") else nav_info
+        route = self._route_hops(nav_dict.get("NavRoute") if isinstance(nav_dict, dict) else None)
+        if not route:
+            return
+        next_hop = route[0]
+        assessment = (
+            self._lookup_route_safety_assessment(next_hop.system_address)
+            if next_hop.system_address is not None else None
+        )
+        if assessment is not None and assessment.status != "unknown":
+            return
+        language = configured_warning_language(cast(dict[str, object], self.config))
+        text = (
+            f"Prochain système : {next_hop.name}. Sa géométrie stellaire n'est pas cartographiée ; le risque d'étoiles proches ne peut pas être évalué."
+            if language == "fr"
+            else f"Next system: {next_hop.name}. Its star geometry is unmapped, so close-star arrival risk cannot be evaluated."
+        )
+        self._speak_route_safety_message(text, projected_states)
+
     def on_event(self, event: Event, projected_states: dict[str, Any]):
+        self._handle_route_safety_prefetch(event, projected_states)
+        self._handle_close_star_jump_guard(event, projected_states)
         self._handle_non_kgbfoam_jump_warning(event, projected_states)
+        if isinstance(event, GameEvent) and event.content.get("event") == "FSDJump":
+            self._warn_if_next_route_hop_is_unmapped(projected_states)
+            arrived = self._route_hops([{
+                "StarSystem": event.content.get("StarSystem"),
+                "SystemAddress": event.content.get("SystemAddress"),
+                "StarPos": event.content.get("StarPos"),
+            }])
+            if arrived:
+                with self._route_safety_lock:
+                    supervisor_decision = self.route_safety_supervisor.on_jump(arrived[0])
+                if supervisor_decision.action != "none":
+                    threading.Thread(
+                        target=self._execute_supervisor_decision,
+                        args=(supervisor_decision, projected_states),
+                        name="route-safety-supervisor",
+                        daemon=True,
+                    ).start()
         for key, value in projected_states.items():
             if self.previous_states.get(key, None) != value:
                 send_message(
@@ -546,9 +921,12 @@ class Chat:
         if isinstance(event, GameEvent) and event.content.get("event") == "FSDTarget":
             if "Name" in event.content:
                 system_name = event.content.get("Name", "Unknown")
-                if system_name != "Unknown" and not self.system_database.has_system(
-                    system_name
-                ):
+                cached_info = (
+                    self.system_database.get_cached_system_info(system_name)
+                    if system_name != "Unknown" else {}
+                )
+                self.system_database.record_fsd_target(cast(dict[str, Any], event.content))
+                if system_name != "Unknown" and not cached_info.get("bodies"):
                     self.system_database.fetch_system_data_nonblocking(system_name)
 
         if isinstance(event, GameEvent) and event.content.get("event") in [

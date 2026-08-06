@@ -7,6 +7,12 @@ from typing import Any, Callable
 import requests
 
 from ..Projections import get_state_dict
+from ..RouteSafety import (
+    RouteSafetyPolicy,
+    SystemSafetyAssessment,
+    filter_route_candidates,
+)
+from ..RouteSafetyProvider import assess_spansh_systems
 
 
 SPANSH_BODIES_URL = "https://spansh.co.uk/api/bodies/search"
@@ -240,6 +246,7 @@ def _route_targets(result: list[dict[str, Any]], jump_range: float) -> list[dict
             )
             targets.append({
                 "system": system.get("name"),
+                "system_id64": system.get("id64"),
                 "body": body.get("name"),
                 "distance_ly": round(math.dist(
                     [float(source.get(axis) or 0) for axis in ("x", "y", "z")],
@@ -466,12 +473,15 @@ def _group_stratum_targets(
         coordinates = _system_coordinates(body)
         group = groups.setdefault(system_name, {
             "system": system_name,
+            "system_id64": body.get("system_id64"),
             "coordinates": coordinates,
             "search_distance_ly": float(body.get("distance") or 0),
             "bodies": [],
         })
         if group["coordinates"] is None and coordinates is not None:
             group["coordinates"] = coordinates
+        if group["system_id64"] is None and body.get("system_id64") is not None:
+            group["system_id64"] = body.get("system_id64")
         group["bodies"].append({
             "body": body_name,
             "body_id": body.get("body_id"),
@@ -508,6 +518,7 @@ def _group_stratum_targets(
         potential_per_hour = round(potential_value / estimated_seconds * 3600)
         targets.append({
             "system": group["system"],
+            "system_id64": group["system_id64"],
             "body": candidate_bodies[0]["body"],
             "bodies": candidate_bodies,
             "candidate_body_count": len(candidate_bodies),
@@ -585,6 +596,120 @@ def _group_stratum_targets(
     return ordered
 
 
+def _system_id64(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _assess_destination_systems(
+    targets: list[dict[str, Any]],
+    policy: RouteSafetyPolicy,
+    *,
+    request_post: Callable[..., Any],
+) -> tuple[dict[int, SystemSafetyAssessment], str | None]:
+    """Fetch catalogue geometry, then classify locally without LLM calls."""
+    names_by_id: dict[int, str] = {}
+    for target in targets:
+        system_id = _system_id64(target.get("system_id64"))
+        if system_id is not None:
+            names_by_id.setdefault(system_id, str(target.get("system") or "Unknown system"))
+    return assess_spansh_systems(
+        names_by_id,
+        policy,
+        request_post=request_post,
+    )
+
+
+def _resequence_route_targets(
+    targets: list[dict[str, Any]],
+    source_coords: dict[str, float] | None,
+) -> None:
+    """Repair route metadata after candidate exclusions."""
+    previous_coords = source_coords
+    for index, target in enumerate(targets, start=1):
+        target["route_order"] = index
+        coordinates = target.get("coordinates")
+        leg_distance = (
+            _coordinate_distance(previous_coords, coordinates)
+            if previous_coords is not None and isinstance(coordinates, dict)
+            else target.get("distance_ly")
+        )
+        target["route_leg_distance_ly"] = round(float(leg_distance or 0), 2)
+        if isinstance(coordinates, dict):
+            previous_coords = coordinates
+
+
+def _apply_route_safety(
+    plan: dict[str, Any],
+    policy: RouteSafetyPolicy,
+    *,
+    max_results: int,
+    source_coords: dict[str, float] | None,
+    request_post: Callable[..., Any],
+) -> None:
+    candidates = list(plan.get("targets") or [])
+    if not policy.enabled:
+        plan["targets"] = candidates[:max_results]
+        plan["route_safety"] = {
+            "enabled": False,
+            "coverage": "destination_systems_only",
+            "intermediate_hops": "not_controllable_by_current_elite_plotter",
+            "message": "Close-star destination screening is disabled.",
+        }
+        return
+
+    assessments, provider_error = _assess_destination_systems(
+        candidates,
+        policy,
+        request_post=request_post,
+    )
+    filtered = filter_route_candidates(candidates, assessments, policy)
+    included = filtered.included[:max_results]
+    if plan.get("strategy") == "stratum_sniping":
+        _resequence_route_targets(included, source_coords)
+    plan["targets"] = included
+
+    unique_assessments = {
+        target["route_safety"]["system_id64"]: target["route_safety"]
+        for target in (*filtered.included, *filtered.excluded)
+        if target.get("route_safety", {}).get("system_id64") is not None
+    }
+    plan["route_safety"] = {
+        "enabled": True,
+        "rule": "minimum_or_recorded_surface_gap_lte_combined_radii_times_configured_ratio",
+        "max_surface_gap_ratio": policy.max_surface_gap_ratio,
+        "unknown_system_policy": policy.unknown_system_policy,
+        "coverage": "destination_systems_only",
+        "intermediate_hops": "not_controllable_by_current_elite_plotter",
+        "data_source": "Spansh exact system-id star records",
+        "candidate_systems": len({str(target.get("system")) for target in candidates}),
+        "evaluated_systems": sum(
+            assessment["status"] in ("safe", "dangerous")
+            for assessment in unique_assessments.values()
+        ),
+        "excluded_systems": [
+            target["route_safety"] for target in filtered.excluded
+        ],
+        "unknown_allowed_systems": [
+            target["route_safety"] for target in filtered.unknown_allowed
+        ],
+        "provider_error": provider_error,
+        "message": (
+            "Only destination systems were screened. Elite still chooses intermediate hyperspace hops, "
+            "and Nova cannot exclude systems from that internal plotter."
+        ),
+    }
+    if candidates and not included:
+        plan["route_safety"]["no_route_reason"] = (
+            "Every returned destination was excluded by the close-star safety policy."
+        )
+
+
 def plan_first_discovery(
     source_system: str | None,
     jump_range: float,
@@ -640,6 +765,7 @@ def plan_exobiology(
     obj: dict[str, Any],
     projected_states: Any,
     *,
+    route_safety_policy: RouteSafetyPolicy | None = None,
     request_post: Callable[..., Any] = requests.post,
     request_get: Callable[..., Any] = requests.get,
     sleep: Callable[[float], None] = time.sleep,
@@ -669,6 +795,9 @@ def plan_exobiology(
     max_arrival_ls = max(100, min(100_000, int(
         obj.get("max_arrival_ls") or DEFAULT_MAX_ARRIVAL_LS
     )))
+    # Fetch enough alternatives to replace excluded destinations. The public
+    # action still returns at most the requested number.
+    search_max_results = 20 if route_safety_policy is not None else max_results
 
     if strategy == "confirmed_throughput":
         if source_system is None:
@@ -680,7 +809,7 @@ def plan_exobiology(
             source_system,
             jump_range,
             radius=radius,
-            max_results=max_results,
+            max_results=search_max_results,
             request_post=request_post,
             request_get=request_get,
             sleep=sleep,
@@ -700,10 +829,19 @@ def plan_exobiology(
             source_system,
             jump_range,
             radius=search_radius,
-            max_results=max_results,
+            max_results=search_max_results,
             source_coords=source_coords,
             reference_coords=search_center,
             max_arrival_ls=max_arrival_ls,
+            request_post=request_post,
+        )
+
+    if route_safety_policy is not None:
+        _apply_route_safety(
+            plan,
+            route_safety_policy,
+            max_results=max_results,
+            source_coords=source_coords,
             request_post=request_post,
         )
 

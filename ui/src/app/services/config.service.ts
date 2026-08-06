@@ -183,6 +183,10 @@ export interface Config {
     qol_autoscan: boolean; // Quality of life: Auto scan when entering new systems
     qol_non_kgbfoam_jump_warning: boolean;
     qol_non_kgbfoam_unknown_warning: boolean;
+    route_safety_close_star_enabled: boolean;
+    route_safety_cancel_dangerous_charge: boolean;
+    route_safety_unknown_system_policy: "allow" | "exclude";
+    route_safety_max_surface_gap_ratio: number;
     
     // Overlay settings
     overlay_show_avatar: boolean;

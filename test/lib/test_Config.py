@@ -20,7 +20,7 @@ from src.lib.Config import (
 def test_migrate_empty_allowed_actions_enables_all_current_actions() -> None:
     migrated = migrate({"config_version": 18, "allowed_actions": []})
 
-    assert migrated["config_version"] == 22
+    assert migrated["config_version"] == 23
     assert migrated["allowed_actions"] == default_allowed_actions
     assert all(migrated["allowed_actions"].values())
 
@@ -94,7 +94,7 @@ def test_legacy_backup_update_runs_full_action_migration(monkeypatch) -> None:
 
     updated = update_config(current, legacy_backup)  # type: ignore[arg-type]
 
-    assert updated["config_version"] == 22
+    assert updated["config_version"] == 23
     assert updated["allowed_actions"]["fireWeapons"] is True
     assert updated["allowed_actions"]["plotToTarget"] is True
     assert updated["allowed_actions"]["setSpeed"] is False
@@ -107,7 +107,7 @@ def test_migrate_adds_local_tts_settings_and_preserves_stt_language() -> None:
         "stt_language": "fr",
     })
 
-    assert migrated["config_version"] == 22
+    assert migrated["config_version"] == 23
     assert migrated["tts_language"] == "fr"
     assert migrated["tts_chatterbox_endpoint"] == "http://localhost:8004/v1"
     assert migrated["tts_qwen3_endpoint"] == "http://localhost:8005/v1"
@@ -125,7 +125,7 @@ def test_migrate_adds_reasoning_output_and_codex_transport_settings_without_chan
         "agent_llm_model_name": "deepseek-chat",
     })
 
-    assert migrated["config_version"] == 22
+    assert migrated["config_version"] == 23
     assert migrated["llm_provider"] == "custom"
     assert migrated["llm_model_name"] == "deepseek-chat"
     assert migrated["agent_llm_provider"] == "custom"
@@ -149,7 +149,7 @@ def test_migrate_enables_requested_non_kgbfoam_warning_without_touching_profile(
 
     migrated = migrate(legacy)
 
-    assert migrated["config_version"] == 22
+    assert migrated["config_version"] == 23
     assert migrated["qol_non_kgbfoam_jump_warning"] is True
     assert migrated["qol_non_kgbfoam_unknown_warning"] is False
     assert migrated["commander_name"] == "CMDR Test"
@@ -158,6 +158,35 @@ def test_migrate_enables_requested_non_kgbfoam_warning_without_touching_profile(
     assert migrated["tts_provider"] == "chatterbox-local"
     assert migrated["stt_provider"] == "none"
     assert migrated["plugin_settings"] == {"exobiology": {"queue": ["Sample A"]}}
+
+
+def test_close_star_route_safety_migration_preserves_all_existing_state() -> None:
+    legacy = {
+        "config_version": 22,
+        "commander_name": "CMDR Test",
+        "characters": [{"name": "Nova", "tts_voice": "custom"}],
+        "llm_provider": "custom",
+        "tts_provider": "qwen3-tts-local",
+        "cn_autostart": True,
+        "plugin_settings": {"exobiology": {"index": 4, "targets": ["A", "B"]}},
+    }
+
+    migrated = migrate(legacy)
+
+    assert migrated["config_version"] == 23
+    assert migrated["route_safety_close_star_enabled"] is True
+    assert migrated["route_safety_cancel_dangerous_charge"] is True
+    assert migrated["route_safety_unknown_system_policy"] == "allow"
+    assert migrated["route_safety_max_surface_gap_ratio"] == 1.0
+    for key in (
+        "commander_name",
+        "characters",
+        "llm_provider",
+        "tts_provider",
+        "cn_autostart",
+        "plugin_settings",
+    ):
+        assert migrated[key] == legacy[key]
 
 
 @pytest.mark.parametrize("embedding_provider", ["google-ai-studio", "custom", "local-ai-server"])

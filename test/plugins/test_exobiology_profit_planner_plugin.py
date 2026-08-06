@@ -37,9 +37,16 @@ def clustered_plan() -> dict:
         "radius_ly": 500,
         "max_arrival_ls": 1700,
         "outward_staging_applied": False,
+        "route_safety": {
+            "enabled": True,
+            "coverage": "destination_systems_only",
+            "intermediate_hops": "guarded_after_navroute_prefetch",
+        },
         "targets": [
             {
                 "system": "Cluster",
+                "system_id64": 10,
+                "route_safety": {"status": "safe", "system_id64": 10},
                 "distance_ly": 40.0,
                 "distance_from_sol_ly": 3040.0,
                 "estimated_jumps": 1,
@@ -130,6 +137,28 @@ def test_find_action_delegates_all_strategies_and_arrival_cap_to_core(monkeypatc
     assert "Never run a full-system FSS" in result["next_action"]
 
 
+def test_configured_find_action_passes_reusable_route_safety_policy(tmp_path, monkeypatch) -> None:
+    plugin, _plotted = make_plugin(tmp_path)
+    plugin._helper._config = {
+        "route_safety_close_star_enabled": True,
+        "route_safety_unknown_system_policy": "exclude",
+        "route_safety_max_surface_gap_ratio": 1.5,
+    }
+    captured = []
+
+    def fake_plan(args, context, *, route_safety_policy):
+        captured.append((args, context, route_safety_policy))
+        return {"strategy": "stratum_sniping", "targets": [], "navigation_instruction": None}
+
+    monkeypatch.setattr(plugin_module, "plan_exobiology", fake_plan)
+    result = json.loads(plugin._find_targets(plugin_module.PlannerParameters(), {}))
+
+    assert result["targets"] == []
+    assert captured[0][2].enabled is True
+    assert captured[0][2].unknown_system_policy == "exclude"
+    assert captured[0][2].max_surface_gap_ratio == 1.5
+
+
 def test_expedition_queue_groups_every_exact_body_by_system() -> None:
     queue = plugin_module._expedition_queue(clustered_plan())
 
@@ -166,6 +195,9 @@ def test_planning_persists_system_queue_and_plots_system_first(tmp_path, monkeyp
     }
     assert persisted["version"] == 3
     assert persisted["queue_granularity"] == "system"
+    assert persisted["route_safety"]["coverage"] == "destination_systems_only"
+    assert persisted["targets"][0]["system_id64"] == 10
+    assert persisted["targets"][0]["route_safety"]["status"] == "safe"
     assert [item["system"] for item in persisted["targets"]] == ["Cluster", "Singleton"]
     assert plotted == [{"system": "Cluster"}]
     assert result["system_queue_size"] == 2

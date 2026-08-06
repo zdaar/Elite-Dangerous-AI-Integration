@@ -2,6 +2,8 @@
 
 COVAS:NEXT exposes deterministic exobiology actions so the assistant can execute a money run without a preliminary web search, memory lookup, or full-system FSS.
 
+Close-star destination filtering and live route supervision are documented in [Close-star route safety](close-star-route-safety.md).
+
 ## Choose the action from the commander's intent
 
 | Intent | Action | Important rule |
@@ -30,7 +32,8 @@ COVAS:NEXT exposes deterministic exobiology actions so the assistant can execute
 3. Applies the atmosphere-specific Tectonicas gravity and temperature envelope.
 4. Groups every surviving exact body by system.
 5. Ranks systems by candidate count, route cost, and arrival distance.
-6. Persists every exact body designation instead of collapsing a system to one body.
+6. Applies the configured close-star safety policy to exact system id64 records and selects a safe alternate when available.
+7. Persists every exact body designation and route-safety assessment instead of collapsing a system to one body.
 
 Do not add `is_landable`, biological signals, genera, or `landmark_value=0` to this legacy search. Those fields require later community data and remove the intended candidate cohort.
 

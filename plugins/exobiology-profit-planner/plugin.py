@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from lib.PluginBase import PluginBase, PluginManifest
 from lib.PluginHelper import PluginHelper
+from lib.RouteSafety import RouteSafetyPolicy, route_safety_policy_from_config
 from lib.actions.ExobiologyPlanner import plan_exobiology
 
 
@@ -340,16 +341,21 @@ def _plot_result_payload(
     }
 
 
-def _plan(parameters: PlannerParameters, context: dict[str, Any]) -> str:
-    args = parameters.model_dump(exclude_none=True)
-    plan = plan_exobiology(args, context)
+def _render_plan(plan: dict[str, Any]) -> str:
     plan["next_action"] = (
         "Call plotToTarget for navigation_instruction immediately. For Stratum sniping, plot the system first; "
         "after arrival select or FSS-resolve only targeted_fss_bodies. Never run a full-system FSS. "
         "Verify the final live NavRoute entry exactly matches the requested system before reporting a successful route. "
-        "Any distance_ly in this result is measured from the planning source, not a live remaining distance."
+        "Any distance_ly in this result is measured from the planning source, not a live remaining distance. "
+        "Close-star screening covers listed destinations only; never claim that Elite's intermediate hops were excluded."
     )
     return json.dumps(plan, ensure_ascii=False)
+
+
+def _plan(parameters: PlannerParameters, context: dict[str, Any]) -> str:
+    """Compatibility entry point for tests and callers without app config."""
+    args = parameters.model_dump(exclude_none=True)
+    return _render_plan(plan_exobiology(args, context))
 
 
 def _expedition_queue(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -369,6 +375,8 @@ def _expedition_queue(plan: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         queue.append({
             "system": system,
+            "system_id64": system_target.get("system_id64"),
+            "route_safety": system_target.get("route_safety"),
             "system_queue_position": system_index,
             "candidate_count": len(body_names),
             "targeted_fss_bodies": body_names,
@@ -569,6 +577,40 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
         self._helper: PluginHelper | None = None
         self._expedition_file: Path | None = None
 
+    def _configured_route_safety_policy(self) -> RouteSafetyPolicy | None:
+        if self._helper is None:
+            return None
+        config = getattr(self._helper, "_config", None)
+        if not isinstance(config, dict):
+            return None
+        return route_safety_policy_from_config(config)
+
+    def _configured_plan(
+        self,
+        args: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        policy = self._configured_route_safety_policy()
+        if policy is None:
+            return plan_exobiology(args, context)
+        return plan_exobiology(
+            args,
+            context,
+            route_safety_policy=policy,
+        )
+
+    def _find_targets(
+        self,
+        parameters: PlannerParameters,
+        context: dict[str, Any],
+    ) -> str:
+        return _render_plan(
+            self._configured_plan(
+                parameters.model_dump(exclude_none=True),
+                context,
+            )
+        )
+
     def _load_expedition(self) -> dict[str, Any] | None:
         if self._expedition_file is None or not self._expedition_file.exists():
             return None
@@ -630,6 +672,8 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             "remaining_jumps": navigation["remaining_jumps"],
             "next_jump_target": navigation["next_jump_target"],
             "route_brief": _route_brief(current or {}, states),
+            "route_safety": current.get("route_safety") if current else None,
+            "route_safety_coverage": expedition.get("route_safety"),
             "instruction": current.get("instruction") if current else "Queue complete.",
             "distance_rule": (
                 "The stored distance is from the planning source, not the ship's current distance. "
@@ -646,7 +690,7 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
         })]
 
     def _plan_tectonicas_expedition(self, parameters: TectonicasExpeditionParameters, context: dict[str, Any]) -> str:
-        plan = plan_exobiology({
+        plan = self._configured_plan({
             "strategy": "stratum_sniping",
             "radius": parameters.search_radius_ly,
             "max_results": parameters.max_systems,
@@ -662,6 +706,7 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
                 ),
                 "strategy": plan.get("strategy"),
                 "search_center_coords": plan.get("search_center_coords"),
+                "route_safety": plan.get("route_safety"),
             }, ensure_ascii=False)
         expedition = {
             "version": 3,
@@ -673,6 +718,7 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             "radius_ly": plan.get("radius_ly"),
             "max_arrival_ls": plan.get("max_arrival_ls"),
             "outward_staging_applied": plan.get("outward_staging_applied"),
+            "route_safety": plan.get("route_safety"),
             "system_count": len(plan.get("targets") or []),
             "index": 0,
             "targets": queue,
@@ -691,6 +737,7 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             "system_queue_size": len(queue),
             "current_target": queue[0],
             "targeted_fss_bodies": queue[0]["targeted_fss_bodies"],
+            "route_safety": plan.get("route_safety"),
             "plot_result": plot_result,
             "route_brief": plot_result["route_brief"],
             "instruction": queue[0]["instruction"],
@@ -842,7 +889,7 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
                     "route/queue status, direct navigation, or sampling organisms on the current body; do not fall back to a generic search."
                 ),
                 parameters=PlannerParameters,
-                method=_plan,
+                method=self._find_targets,
                 action_type="web",
                 input_template=lambda args, _context: "Optimizing an exobiology route from the current system",
             )

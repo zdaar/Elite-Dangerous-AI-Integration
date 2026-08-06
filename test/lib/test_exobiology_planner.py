@@ -17,6 +17,7 @@ from src.lib.actions.ExobiologyPlanner import (
     current_jump_range,
     plan_exobiology,
 )
+from src.lib.RouteSafety import RouteSafetyPolicy
 
 
 class FakeResponse:
@@ -43,6 +44,7 @@ def old_hmc_body(
     atmosphere: str = "Thin Carbon dioxide",
     gravity: float = 0.30,
     temperature: float = 220,
+    system_id64: int | None = None,
 ) -> dict:
     return {
         "system_name": system,
@@ -59,6 +61,7 @@ def old_hmc_body(
         "system_z": coordinates[2],
         "updated_at": "2020-07-13 16:23:39+00",
         "volcanism_type": "No volcanism",
+        "system_id64": system_id64,
     }
 
 
@@ -367,3 +370,132 @@ def test_named_system_is_fallback_when_starpos_is_unavailable() -> None:
     assert captured[0]["reference_system"] == "Sol"
     assert "reference_coords" not in captured[0]
     assert captured[0]["filters"]["distance_to_arrival"]["value"] == [0, 1700]
+
+
+def _catalogue_star(system_id64: int, name: str, *, main: bool, distance: float, radius: float) -> dict:
+    return {
+        "system_id64": system_id64,
+        "type": "Star",
+        "name": name,
+        "subtype": "K (Yellow-Orange) Star",
+        "is_main_star": main,
+        "distance_to_arrival": distance,
+        "solar_radius": radius,
+        "parents": [{"Null": 0}],
+    }
+
+
+def test_route_safety_excludes_dangerous_destination_and_selects_alternate() -> None:
+    posts = []
+
+    def fake_post(_url, **kwargs):
+        request = json.loads(kwargs["data"])
+        posts.append(request)
+        if request["filters"].get("type") == {"value": ["Star"]}:
+            return FakeResponse({
+                "count": 3,
+                "results": [
+                    _catalogue_star(10, "Danger A", main=True, distance=0, radius=1.0),
+                    _catalogue_star(10, "Danger B", main=False, distance=5.0, radius=1.0),
+                    _catalogue_star(11, "Safe A", main=True, distance=0, radius=1.0),
+                ],
+            })
+        return FakeResponse({
+            "results": [
+                old_hmc_body("Danger", "Danger A 2", (3_010, 0, 0), system_id64=10),
+                old_hmc_body("Safe", "Safe A 2", (3_020, 0, 0), system_id64=11),
+            ],
+        })
+
+    plan = plan_exobiology(
+        {"strategy": "auto", "max_results": 1},
+        {
+            "Location": {"StarSystem": "Start", "StarPos": [3_000, 0, 0]},
+            "ShipInfo": {"CurrentJumpRange": 50},
+        },
+        route_safety_policy=RouteSafetyPolicy(),
+        request_post=fake_post,
+    )
+
+    assert [target["system"] for target in plan["targets"]] == ["Safe"]
+    assert plan["navigation_instruction"] == {"system": "Safe"}
+    assert plan["recommended_target"]["route_order"] == 1
+    assert plan["recommended_target"]["route_leg_distance_ly"] == 20.0
+    assert plan["route_safety"]["excluded_systems"][0]["system"] == "Danger"
+    assert plan["route_safety"]["coverage"] == "destination_systems_only"
+    assert plan["route_safety"]["intermediate_hops"] == "not_controllable_by_current_elite_plotter"
+    assert len(posts) == 2
+
+
+def test_route_safety_all_excluded_returns_no_navigation_outcome() -> None:
+    def fake_post(_url, **kwargs):
+        request = json.loads(kwargs["data"])
+        if request["filters"].get("type") == {"value": ["Star"]}:
+            return FakeResponse({
+                "count": 2,
+                "results": [
+                    _catalogue_star(10, "Danger A", main=True, distance=0, radius=1.0),
+                    _catalogue_star(10, "Danger B", main=False, distance=5.0, radius=1.0),
+                ],
+            })
+        return FakeResponse({
+            "results": [old_hmc_body("Danger", "Danger A 2", (3_010, 0, 0), system_id64=10)],
+        })
+
+    plan = plan_exobiology(
+        {"strategy": "auto"},
+        {
+            "Location": {"StarSystem": "Start", "StarPos": [3_000, 0, 0]},
+            "ShipInfo": {"CurrentJumpRange": 50},
+        },
+        route_safety_policy=RouteSafetyPolicy(),
+        request_post=fake_post,
+    )
+
+    assert plan["targets"] == []
+    assert plan["navigation_instruction"] is None
+    assert "Every returned destination" in plan["route_safety"]["no_route_reason"]
+
+
+def test_route_safety_provider_failure_allows_unknown_by_default() -> None:
+    calls = 0
+
+    def fake_post(_url, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return FakeResponse({
+                "results": [old_hmc_body("Unmapped", "Unmapped A 2", (3_010, 0, 0), system_id64=10)],
+            })
+        raise RuntimeError("offline")
+
+    plan = plan_exobiology(
+        {"strategy": "auto"},
+        {
+            "Location": {"StarSystem": "Start", "StarPos": [3_000, 0, 0]},
+            "ShipInfo": {"CurrentJumpRange": 50},
+        },
+        route_safety_policy=RouteSafetyPolicy(),
+        request_post=fake_post,
+    )
+
+    assert plan["recommended_target"]["system"] == "Unmapped"
+    assert plan["recommended_target"]["route_safety"]["status"] == "unknown"
+    assert "offline" in plan["route_safety"]["provider_error"]
+
+
+def test_strict_unknown_policy_can_return_no_route_for_missing_id64() -> None:
+    plan = plan_exobiology(
+        {"strategy": "auto"},
+        {
+            "Location": {"StarSystem": "Start", "StarPos": [3_000, 0, 0]},
+            "ShipInfo": {"CurrentJumpRange": 50},
+        },
+        route_safety_policy=RouteSafetyPolicy(unknown_system_policy="exclude"),
+        request_post=lambda *_args, **_kwargs: FakeResponse({
+            "results": [old_hmc_body("No Id", "No Id A 2", (3_010, 0, 0))],
+        }),
+    )
+
+    assert plan["targets"] == []
+    assert plan["route_safety"]["excluded_systems"][0]["status"] == "unknown"

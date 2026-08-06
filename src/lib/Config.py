@@ -969,6 +969,10 @@ class Config(TypedDict):
     qol_autoscan: bool  # Quality of life: Auto scan when entering new systems
     qol_non_kgbfoam_jump_warning: bool
     qol_non_kgbfoam_unknown_warning: bool
+    route_safety_close_star_enabled: bool
+    route_safety_cancel_dangerous_charge: bool
+    route_safety_unknown_system_policy: Literal['allow', 'exclude']
+    route_safety_max_surface_gap_ratio: float
     prefer_primary_bindings: bool  # Prefer primary keybinds over secondary entries
     
     # Overlay settings
@@ -1376,6 +1380,15 @@ def migrate(data: dict) -> dict:
         data.setdefault('qol_non_kgbfoam_unknown_warning', False)
         data['config_version'] = 22
 
+    if data['config_version'] < 23:
+        # Close-star route safety is destination-only until Nova owns a galaxy
+        # pathfinder. Unknown catalogue data remains routeable by default.
+        data.setdefault('route_safety_close_star_enabled', True)
+        data.setdefault('route_safety_cancel_dangerous_charge', True)
+        data.setdefault('route_safety_unknown_system_policy', 'allow')
+        data.setdefault('route_safety_max_surface_gap_ratio', 1.0)
+        data['config_version'] = 23
+
     return data
 
 
@@ -1478,7 +1491,7 @@ def getDefaultCharacter(config: Config) -> Character:
 
 def load_config() -> Config:
     defaults: Config = {
-        'config_version': 22,
+        'config_version': 23,
         'commander_name': "",
         'characters': [],
         'active_character_index': 0,  # -1 means using the default legacy character
@@ -1561,6 +1574,10 @@ def load_config() -> Config:
         "qol_autoscan": False,  # Quality of life: Auto scan when entering new systems
         "qol_non_kgbfoam_jump_warning": True,
         "qol_non_kgbfoam_unknown_warning": False,
+        "route_safety_close_star_enabled": True,
+        "route_safety_cancel_dangerous_charge": True,
+        "route_safety_unknown_system_policy": "allow",
+        "route_safety_max_surface_gap_ratio": 1.0,
 
         # Overlay settings - defaults
         "overlay_show_avatar": True,

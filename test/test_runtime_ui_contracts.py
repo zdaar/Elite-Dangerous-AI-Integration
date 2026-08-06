@@ -78,7 +78,7 @@ def test_non_kgbfoam_warning_settings_use_normal_persistent_config_path() -> Non
 def test_non_kgbfoam_warning_uses_tts_without_llm_or_navigation_actions() -> None:
     chat = _source("src/Chat.py")
     handler_start = chat.index("def _handle_non_kgbfoam_jump_warning")
-    handler_end = chat.index("\n    def on_event", handler_start)
+    handler_end = chat.index("\n    def _route_safety_policy", handler_start)
     handler = chat[handler_start:handler_end]
 
     assert "self.tts.say(" in handler
@@ -91,4 +91,36 @@ def test_non_kgbfoam_warning_uses_tts_without_llm_or_navigation_actions() -> Non
         "target_next_system_in_route",
         "set_speed",
     ):
+        assert forbidden not in handler
+
+
+def test_close_star_route_settings_use_normal_persistent_config_path() -> None:
+    config_service = _source("ui/src/app/services/config.service.ts")
+    actions_template = _source(
+        "ui/src/app/components/actions-settings/actions-settings.component.html"
+    )
+    actions_component = _source(
+        "ui/src/app/components/actions-settings/actions-settings.component.ts"
+    )
+
+    for setting, type_name in (
+        ("route_safety_close_star_enabled", "boolean"),
+        ("route_safety_cancel_dangerous_charge", "boolean"),
+        ("route_safety_unknown_system_policy", '"allow" | "exclude"'),
+        ("route_safety_max_surface_gap_ratio", "number"),
+    ):
+        assert f"{setting}: {type_name}" in config_service
+        assert f"onConfigChange({{{setting}: $event}})" in actions_template
+    assert "await this.configService.changeConfig(partialConfig)" in actions_component
+
+
+def test_close_star_charge_guard_is_local_and_uses_only_hyperspace_cancel_binding() -> None:
+    chat = _source("src/Chat.py")
+    start = chat.index("def _handle_close_star_jump_guard")
+    end = chat.index("\n    def _warn_if_next_route_hop_is_unmapped", start)
+    handler = chat[start:end]
+
+    assert 'self.ed_keys.send("Hyperspace")' in handler
+    assert "self.tts" not in handler
+    for forbidden in ("llmModel", ".generate(", "web_search", "plotToTarget", "requests"):
         assert forbidden not in handler
