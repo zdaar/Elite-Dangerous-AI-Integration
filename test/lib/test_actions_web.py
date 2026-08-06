@@ -361,6 +361,78 @@ def test_station_request_includes_carriers_and_excludes_planetary_stations() -> 
     assert request["filters"]["is_planetary"] == {"value": False}
 
 
+def test_station_request_serializes_required_services_as_combined_intersection() -> None:
+    request = actions_web.prepare_station_request({
+        "services": [
+            {"name": "Universal Cartographics"},
+            {"name": "Vista Genomics"},
+        ],
+    }, {})
+
+    assert request["filters"]["services"] == [
+        {"name": ["Universal Cartographics"]},
+        {"name": ["Vista Genomics"]},
+    ]
+
+
+def test_station_response_rejects_partial_service_matches_and_exclusions() -> None:
+    request = {
+        "filters": {
+            "services": [
+                {"name": ["Universal Cartographics"]},
+                {"name": ["Vista Genomics"]},
+            ],
+        },
+    }
+    response = {
+        "count": 3,
+        "size": 3,
+        "results": [
+            {
+                "name": "Cartographics Only",
+                "system_name": "Open System",
+                "distance": 1,
+                "distance_to_arrival": 10,
+                "is_planetary": False,
+                "services": [{"name": "Universal Cartographics"}],
+            },
+            {
+                "name": "Excluded Exact Match",
+                "system_name": "Permit System",
+                "distance": 2,
+                "distance_to_arrival": 20,
+                "is_planetary": False,
+                "services": [
+                    {"name": "Universal Cartographics"},
+                    {"name": "Vista Genomics"},
+                ],
+            },
+            {
+                "name": "Valid Exact Match",
+                "system_name": "Open System",
+                "distance": 3,
+                "distance_to_arrival": 30,
+                "is_planetary": False,
+                "services": [
+                    {"name": "Universal Cartographics"},
+                    {"name": "Vista Genomics"},
+                ],
+            },
+        ],
+    }
+
+    filtered = actions_web.filter_station_response(
+        request,
+        response,
+        local_filters={"exclude_systems": ["Permit System"]},
+    )
+
+    assert [result["name"] for result in filtered["results"]] == ["Valid Exact Match"]
+    assert filtered["amount_total"] == 1
+    assert filtered["required_services"] == ["Universal Cartographics", "Vista Genomics"]
+    assert filtered["service_match"] == "all"
+
+
 def test_station_request_uses_default_commodity_market_data_age() -> None:
     request = actions_web.prepare_station_request({
         "commodities": [{"name": "Tritium", "amount": 100, "transaction": "Buy"}],

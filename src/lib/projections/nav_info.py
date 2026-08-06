@@ -196,8 +196,10 @@ class NavInfo(Projection[NavInfoStateModel]):
         # Process FSDJump - remove visited systems from route
         if isinstance(event, GameEvent) and event.content.get("event") == "FSDJump":
             payload = cast(FSDJumpEvent, event.content)
+            arrived_at_scoopable_star = False
             for index, entry in enumerate(self.state.NavRoute):
                 if entry.StarSystem == payload.get("StarSystem"):
+                    arrived_at_scoopable_star = entry.Scoopable
                     self.state.NavRoute = self.state.NavRoute[index + 1 :]
                     break
 
@@ -213,7 +215,11 @@ class NavInfo(Projection[NavInfoStateModel]):
                 remaining_jumps = 0
 
             # Check if we have enough scoopable stars between current and destination system)
-            if not len(self.state.NavRoute) == 0 and remaining_jumps < len(self.state.NavRoute) - 1:
+            if (
+                not arrived_at_scoopable_star
+                and not len(self.state.NavRoute) == 0
+                and remaining_jumps < len(self.state.NavRoute) - 1
+            ):
                 # Count scoopable stars in the remaining jumps
                 scoopable_stars = sum(
                     1

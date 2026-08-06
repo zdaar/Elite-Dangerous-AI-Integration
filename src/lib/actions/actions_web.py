@@ -1,4 +1,5 @@
 import datetime
+import json
 import math
 from typing import cast, Any, List, Dict
 
@@ -216,7 +217,7 @@ def web_search_agent(
             "type": "function",
             "function": {
                 "name": "station_finder",
-                "description": "Find a station for commodities, modules and ships. Sorted by distance or best price when commodity.",
+                "description": "Find a station for commodities, modules, ships, or exact station services. Every requested service must be present in every returned result.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -232,7 +233,9 @@ def web_search_agent(
                         "commodities": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "amount": { "type": "integer" }, "transaction": { "type": "string", "enum": ["Buy", "Sell"] } }, "required": ["name", "amount", "transaction"]} },
                         "market_days_old": { "type": "integer", "minimum": 1, "description": "Maximum age of commodity market data in days. Used only for commodity searches. Default: 2." },
                         "ships": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] } },
-                        "services": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string", "enum": ["Black Market", "Interstellar Factors Contact"] } }, "required": ["name"] } },
+                        "services": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string", "enum": known_services } }, "required": ["name"] }, "description": "Required station services. Results must contain every requested service." },
+                        "exclude_stations": { "type": "array", "items": { "type": "string" }, "description": "Exact station names to exclude." },
+                        "exclude_systems": { "type": "array", "items": { "type": "string" }, "description": "Exact system names to exclude, including inaccessible permit systems." },
                         "sort_by": { "type": "string", "enum": ["distance", "bestprice"], "description": "Sort stations either by distance or best price when commodities are included. Default: bestprice." },
                         "include_player_fleetcarrier": { "type": "boolean", "description": "Include Drake-Class Carrier (player-owned fleet carriers) in searches" },
                         "unfiltered_results": { "type": "object", "description": "Set a category to true to include all returned data instead of only the requested items.", "properties": { "commodities": { "type": "boolean" }, "modules": { "type": "boolean" }, "ships": { "type": "boolean" } } },
@@ -367,7 +370,9 @@ def web_search_agent(
     material_finder returns inventory counts, trade-in calculations, and drop locations.
     blueprint_finder lists material costs per grade, calculates missing materials from inventory, and lists capable engineers.
     engineer_finder reports unlock status (known/invited/unlocked), rank progress, and workshop locations.
-    station_finder can locate Material Traders and Technology Brokers. body_finder finds biological signals and mining hotspots.
+    station_finder can locate Material Traders, Technology Brokers, and exact station services. body_finder finds biological signals and mining hotspots.
+    For a request to sell exploration data, require Universal Cartographics. For genetic/exobiology samples, require Vista Genomics. If both kinds of data must be sold at one stop, call station_finder once with both services. The service list is an intersection: every returned station must contain every requested service.
+    A station result is usable only when the returned services explicitly contain every requested service. Never recommend, rank, or navigate to a partial match. Never replace a failed exact search with a nearby generic station. If the user says a station or system is inaccessible, repeat the search with exclude_stations or exclude_systems. Prefer normal stations; include player fleet carriers only when the user accepts their mobility and docking-access uncertainty.
     When the user asks to find, replace, or optimize an exobiology money destination, call find_exobiology_targets first and only once. Do not approximate targets with body_finder. Use strategy auto unless the user explicitly asks for a public confirmed-organism route, in which case use throughput. Auto means exact pre-Odyssey Stratum leads with possible, never guaranteed, First Logged payout. Preserve navigation_instruction verbatim and tell the parent assistant to call plotToTarget immediately. Label distance_ly as distance from the planning source, not live current distance. The target's targeted_fss_bodies are the only bodies to resolve; never recommend a 100% or full-system FSS. Do not call this planner for current target/route/queue status, organisms already shown on the current body, sampling guidance, or a direct ship/navigation command. Do not fall back to a web search or body_finder when this one call returns no target; report the limitation.
 
     Here are some examples of how to use the tools:
@@ -2104,6 +2109,7 @@ def prepare_station_request(obj, projected_states):# Helper function for fuzzy m
         filters["ships"] = {"value": ships}
     services = filter_empty_list_items(obj.get("services"))
     if services:
+        service_filters = []
         for service in services:
             # Find matching service name using fuzzy matching
             matching_service = find_best_match(service["name"], known_services)
@@ -2111,7 +2117,11 @@ def prepare_station_request(obj, projected_states):# Helper function for fuzzy m
                 raise Exception(
                     f"Invalid service name: {service['name']}. {educated_guesses_message(service['name'], known_services)}")
             service["name"] = matching_service
-        filters["services"] = {"value": services}
+            # Spansh exposes services as a repeated ``combined`` field. One
+            # entry per service is an AND query; the previous group-shaped
+            # payload was silently ignored by Spansh.
+            service_filters.append({"name": [matching_service]})
+        filters["services"] = service_filters
     if "name" in obj and obj["name"]:
         filters["name"] = {
             "value": obj["name"]
@@ -2140,7 +2150,20 @@ def prepare_station_request(obj, projected_states):# Helper function for fuzzy m
 
 
 # filter a spansh station result set for only relevant information
-def filter_station_response(request, response, unfiltered_results=None):
+def _requested_station_services(request):
+    requested = set()
+    for item in request.get("filters", {}).get("services", []):
+        if not isinstance(item, dict):
+            continue
+        names = item.get("name", [])
+        if isinstance(names, str):
+            names = [names]
+        if isinstance(names, list):
+            requested.update(str(name) for name in names if str(name).strip())
+    return requested
+
+
+def filter_station_response(request, response, unfiltered_results=None, local_filters=None):
     unfiltered_results = unfiltered_results or {}
     unfiltered_markets = unfiltered_results.get("commodities", False)
     unfiltered_modules = unfiltered_results.get("modules", False)
@@ -2149,13 +2172,36 @@ def filter_station_response(request, response, unfiltered_results=None):
     commodities_requested = {item["name"] for item in request["filters"].get("market", {})}
     modules_requested = {item["name"] for item in request["filters"].get("modules", {})}
     ships_requested = {item["name"] for item in request["filters"].get("ships", {}).get("value", [])}
-    services_requested = {item["name"] for item in request["filters"].get("services", {}).get("value", [])}
+    services_requested = _requested_station_services(request)
+    local_filters = local_filters or {}
+    excluded_stations = {
+        str(name).strip().casefold()
+        for name in local_filters.get("exclude_stations", [])
+        if str(name).strip()
+    }
+    excluded_systems = {
+        str(name).strip().casefold()
+        for name in local_filters.get("exclude_systems", [])
+        if str(name).strip()
+    }
 
     log('debug', 'modules_requested', modules_requested)
 
     filtered_results = []
 
     for result in response["results"]:
+        if str(result.get("name", "")).strip().casefold() in excluded_stations:
+            continue
+        if str(result.get("system_name", "")).strip().casefold() in excluded_systems:
+            continue
+        result_services = {
+            str(service.get("name", ""))
+            for service in result.get("services", [])
+            if isinstance(service, dict) and str(service.get("name", "")).strip()
+        }
+        if services_requested and not services_requested.issubset(result_services):
+            # Never trust a remote filter alone for an operational destination.
+            continue
         filtered_result = {
             "name": result["name"],
             "system": result["system_name"],
@@ -2218,10 +2264,13 @@ def filter_station_response(request, response, unfiltered_results=None):
         filtered_results.append(filtered_result)
 
     filtered_response = {
-        "amount_total": response["count"],
-        "amount_displayed": min(response["count"], response["size"]),
+        "amount_total": len(filtered_results),
+        "amount_displayed": len(filtered_results),
         "results": filtered_results
     }
+    if services_requested:
+        filtered_response["required_services"] = sorted(services_requested)
+        filtered_response["service_match"] = "all"
     market_updated_at = request["filters"].get("market_updated_at")
     if market_updated_at:
         filtered_response["market_data_max_age_days"] = int(market_updated_at["value"][0][4:-1])
@@ -2236,12 +2285,28 @@ def station_finder(obj, projected_states):
     url = "https://spansh.co.uk/api/stations/search"
     response = None
     try:
-        response = requests.post(url, json=request_body, timeout=15)
+        # This is the transport emitted by the current Spansh web client. The
+        # endpoint accepts JSON text labelled as form data; using ``json=`` has
+        # historically caused filters to be ignored or rejected.
+        response = requests.post(
+            url,
+            data=json.dumps(request_body),
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            },
+            timeout=15,
+        )
         response.raise_for_status()  # Raises an HTTPError for bad responses (4xx and 5xx)
 
         data = response.json()
 
-        filtered_data = filter_station_response(request_body, data, obj.get("unfiltered_results"))
+        filtered_data = filter_station_response(
+            request_body,
+            data,
+            obj.get("unfiltered_results"),
+            obj,
+        )
 
         return f'Here is a list of stations: {json.dumps(filtered_data)}'
     except Exception as e:

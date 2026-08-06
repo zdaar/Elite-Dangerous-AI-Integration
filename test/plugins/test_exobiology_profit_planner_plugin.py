@@ -643,6 +643,29 @@ def test_french_exploration_station_lookup_prefers_science_officer(tmp_path, mon
     assert "away missions" in result["evidence"][0]["content"]
 
 
+def test_french_data_sale_lookup_returns_both_required_station_services(tmp_path, monkeypatch) -> None:
+    guide = tmp_path / "elite-station-services" / "SKILL.md"
+    guide.parent.mkdir(parents=True)
+    guide.write_text(
+        "# Sale destinations\nExploration and cartographic scan data is sold at Universal Cartographics. "
+        "Genetic and exobiology samples are sold at Vista Genomics. To sell both at one stop, "
+        "the station must explicitly list both services.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(plugin_module, "_knowledge_root", lambda: tmp_path)
+
+    result = json.loads(plugin_module._guide_lookup(
+        plugin_module.GuideLookupParameters(
+            query="Où vendre mes données d'exploration et mes échantillons exobiologiques ?"
+        ),
+        {},
+    ))
+
+    assert result["verified"] is True
+    assert "Universal Cartographics" in result["evidence"][0]["content"]
+    assert "Vista Genomics" in result["evidence"][0]["content"]
+
+
 def test_knowledge_root_prefers_explicit_environment_override(tmp_path, monkeypatch) -> None:
     explicit = tmp_path / "custom-elite-guide"
     explicit.mkdir()

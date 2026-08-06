@@ -56,7 +56,9 @@ FRENCH_SEARCH_TERMS = {
     "valeur": "value credits payout", "combinaison": "suit Artemis", "planète": "planet body",
     "planete": "planet body", "espèce": "species organism genus", "espece": "species organism genus",
     "première découverte": "first discovery bonus first logged", "premiere decouverte": "first discovery bonus first logged",
-    "route": "route routing", "vendre": "sell Vista Genomics", "filtre": "filter DSS overlay",
+    "route": "route routing", "vendre": "sell Universal Cartographics Vista Genomics", "filtre": "filter DSS overlay",
+    "exploration": "exploration scan data Universal Cartographics", "cartographie": "mapping data Universal Cartographics",
+    "données": "data exploration exobiology", "donnees": "data exploration exobiology",
     "commande": "command say phrase voiceattack", "demander": "request", "amarrage": "docking dock",
     "réparer": "fix repair diagnostics", "reparer": "fix repair diagnostics",
     "onglet": "tab panel diagnostics desync", "désynchron": "desync diagnostics panel tracking",
@@ -1086,6 +1088,15 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             "first_logged_rule": (
                 "First Footfall and a stale community record never prove First Logged availability. State confirmed base value; "
                 "label 5x as potential until a sale event confirms it."
+            ),
+            "operational_goal_rule": (
+                "A naturally stated operational goal is a request for action. If the commander says they want to return and sell data, "
+                "find the required destination immediately; never wait for a second request phrased as 'search'."
+            ),
+            "station_service_rule": (
+                "Exploration/cartographic data requires Universal Cartographics; genetic/exobiology samples require Vista Genomics. "
+                "To sell both at one stop, require both services in the same station_finder call and accept only rows whose returned "
+                "service list explicitly contains both. A partial match is failure and must never be plotted."
             ),
         })])
         helper.register_status_generator(self._expedition_status)

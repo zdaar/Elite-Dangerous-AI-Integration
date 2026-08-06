@@ -16,6 +16,7 @@ def test_elite_guide_bundle_contains_runtime_authorities() -> None:
         "elite-hcs-astra/references/commands.md",
         "elite-spansh/SKILL.md",
         "elite-spansh/references/search-api.md",
+        "elite-station-services/SKILL.md",
     }
 
     bundled = {

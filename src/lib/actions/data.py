@@ -1230,7 +1230,7 @@ known_services = [
     "Shipyard",
     "Shop",
     "Social Space",
-    "System Colonisation"
+    "System Colonisation",
     "Technology Broker",
     "Universal Cartographics",
     "Vista Genomics"
