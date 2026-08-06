@@ -216,13 +216,13 @@ def test_auto_posts_raw_json_and_works_with_unknown_system_name_via_starpos() ->
     assert plan["compatible_candidate_bodies"] == 1
 
 
-def test_auto_moves_search_center_outward_and_marks_high_confidence_targets() -> None:
+def test_auto_moves_search_center_outward_without_creating_an_unrouteable_leg() -> None:
     captured = []
 
     def fake_post(url, **kwargs):
         captured.append(json.loads(kwargs["data"]))
         return FakeResponse({
-            "results": [old_hmc_body("Outer Target", "Outer Target 4", (3_100, 0, 0))],
+            "results": [old_hmc_body("Outer Target", "Outer Target 4", (2_600, 0, 0))],
         })
 
     plan = plan_exobiology(
@@ -234,11 +234,39 @@ def test_auto_moves_search_center_outward_and_marks_high_confidence_targets() ->
         request_post=fake_post,
     )
 
-    assert captured[0]["reference_coords"] == {"x": 3500.0, "y": 0.0, "z": 0.0}
+    # Stage the search outward without ever returning a body more than 900 ly
+    # from the live position. This keeps the resulting leg routeable even when
+    # Elite is still configured for economical routing.
+    assert captured[0]["reference_coords"] == {"x": 2200.0, "y": 0.0, "z": 0.0}
     assert plan["outward_staging_applied"] is True
-    assert plan["recommended_target"]["distance_ly"] == 1300.0
-    assert plan["recommended_target"]["distance_from_sol_ly"] == 3100.0
-    assert plan["recommended_target"]["confidence_tier"] == "high"
+    assert plan["recommended_target"]["distance_ly"] == 800.0
+    assert plan["recommended_target"]["distance_from_sol_ly"] == 2600.0
+    assert plan["recommended_target"]["confidence_tier"] == "medium"
+
+
+def test_outward_staging_clamps_a_large_requested_radius_to_a_routeable_sphere() -> None:
+    captured = []
+
+    def fake_post(url, **kwargs):
+        captured.append(json.loads(kwargs["data"]))
+        return FakeResponse({
+            "results": [old_hmc_body("Staged Target", "Staged Target 2", (2_650, 0, 0))],
+        })
+
+    plan = plan_exobiology(
+        {"strategy": "auto", "radius": 5_000},
+        {
+            "Location": {"StarSystem": "Known Locally", "StarPos": [1_800, 0, 0]},
+            "ShipInfo": {"CurrentJumpRange": 60},
+        },
+        request_post=fake_post,
+    )
+
+    assert captured[0]["filters"]["distance"] == {"min": 0, "max": 800}
+    assert captured[0]["reference_coords"] == {"x": 1900.0, "y": 0.0, "z": 0.0}
+    assert plan["requested_radius_ly"] == 5_000
+    assert plan["radius_ly"] == 800
+    assert plan["recommended_target"]["distance_ly"] == 850.0
 
 
 def test_stratum_post_filter_applies_atmosphere_specific_ranges() -> None:

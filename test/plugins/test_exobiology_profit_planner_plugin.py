@@ -90,9 +90,12 @@ def make_plugin(tmp_path: Path):
     plugin._expedition_file = tmp_path / "expedition.json"
     plotted: list[dict] = []
 
-    def plot(args, _context):
+    def plot(args, context):
         plotted.append(args)
-        return "plotted"
+        if args.get("body"):
+            return f"In-system navigation to {args['body']} completed."
+        context.setdefault("NavInfo", {})["NavRoute"] = [{"StarSystem": args["system"]}]
+        return f"Route to {args['system']} successfully plotted (Jumps: 3)"
 
     plugin._helper = SimpleNamespace(
         _action_manager=SimpleNamespace(actions={"plotToTarget": {"method": plot}})
@@ -171,6 +174,8 @@ def test_planning_persists_body_queue_and_plots_system_first(tmp_path, monkeypat
     ]
     assert plotted == [{"system": "Cluster"}]
     assert result["body_queue_size"] == 3
+    assert result["success"] is True
+    assert result["route_verified"] is True
     assert result["targeted_fss_bodies"] == ["Cluster A 2", "Cluster A 3"]
     assert "First Footfall is a surface marker and pays no bonus" in result["warning"]
 
@@ -193,6 +198,9 @@ def test_next_and_previous_select_exact_body_only_inside_target_system(tmp_path)
         {"system": "Cluster", "body": "Cluster A 2"},
     ]
     assert next_result["current_target"]["body"] == "Cluster A 3"
+    assert next_result["success"] is True
+    assert next_result["route_verified"] is False
+    assert next_result["navigation_verified"] is True
     assert next_result["targeted_fss_bodies"] == ["Cluster A 2", "Cluster A 3"]
     assert previous_result["current_target"]["body"] == "Cluster A 2"
 
@@ -210,3 +218,242 @@ def test_next_to_another_system_plots_system_not_remote_body(tmp_path) -> None:
     assert plotted == [{"system": "Singleton"}]
     assert result["current_target"]["body"] == "Singleton 4"
     assert result["plot_result"]["requested"] == {"system": "Singleton"}
+    assert result["plot_result"]["status"] == "route_plotted"
+
+
+def test_set_uses_one_based_index_and_can_skip_plot(tmp_path) -> None:
+    plugin, plotted = make_plugin(tmp_path)
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+
+    result = json.loads(plugin._control_expedition(
+        plugin_module.ExpeditionControlParameters(operation="set", index=3, plot=False),
+        {"Location": {"StarSystem": "Cluster"}},
+    ))
+    persisted = plugin._load_expedition()
+
+    assert result["success"] is True
+    assert result["queue_updated"] is True
+    assert result["queue_index"] == 3
+    assert result["queue_progress"] == "3/3"
+    assert result["current_target"]["body"] == "Singleton 4"
+    assert result["plot_requested"] is False
+    assert result["route_verified"] is False
+    assert result["navigation_state"] == "no_verified_route"
+    assert result["plot_result"] is None
+    assert persisted["index"] == 2
+    assert plotted == []
+
+
+def test_set_rejects_missing_or_out_of_bounds_index_without_mutating_queue(tmp_path) -> None:
+    plugin, plotted = make_plugin(tmp_path)
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 1, "targets": queue})
+
+    missing = json.loads(plugin._control_expedition(
+        plugin_module.ExpeditionControlParameters(operation="set"),
+        {"Location": {"StarSystem": "Cluster"}},
+    ))
+    out_of_bounds = json.loads(plugin._control_expedition(
+        plugin_module.ExpeditionControlParameters(operation="set", index=4),
+        {"Location": {"StarSystem": "Cluster"}},
+    ))
+
+    assert missing["success"] is False
+    assert missing["valid_index_range"] == {"min": 1, "max": 3}
+    assert out_of_bounds["success"] is False
+    assert out_of_bounds["requested_index"] == 4
+    assert out_of_bounds["valid_index_range"] == {"min": 1, "max": 3}
+    assert plugin._load_expedition()["index"] == 1
+    assert plotted == []
+
+
+def test_set_with_plot_reports_verified_result(tmp_path) -> None:
+    plugin, plotted = make_plugin(tmp_path)
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+
+    result = json.loads(plugin._control_expedition(
+        plugin_module.ExpeditionControlParameters(operation="set", index=2),
+        {"Location": {"StarSystem": "Cluster"}},
+    ))
+
+    assert result["success"] is True
+    assert result["queue_index"] == 2
+    assert result["route_verified"] is False
+    assert result["navigation_verified"] is True
+    assert result["navigation_state"] == "already_in_target_system"
+    assert result["plot_result"]["status"] == "body_selected"
+    assert plotted == [{"system": "Cluster", "body": "Cluster A 3"}]
+
+
+def test_failed_plot_is_not_reported_as_success_but_queue_position_is_saved(tmp_path) -> None:
+    plugin, plotted = make_plugin(tmp_path)
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+
+    def failed_plot(args, _context):
+        plotted.append(args)
+        return f"Failed to plot a route to {args['system']}"
+
+    plugin._helper._action_manager.actions["plotToTarget"]["method"] = failed_plot
+    result = json.loads(plugin._control_expedition(
+        plugin_module.ExpeditionControlParameters(operation="set", index=3),
+        {"Location": {"StarSystem": "Cluster"}},
+    ))
+
+    assert result["success"] is False
+    assert result["queue_updated"] is True
+    assert result["queue_index"] == 3
+    assert result["route_verified"] is False
+    assert result["plot_result"]["status"] == "plot_failed"
+    assert plugin._load_expedition()["index"] == 2
+
+
+def test_body_lookup_without_selection_is_not_navigation_success() -> None:
+    target = {"system": "Cluster", "body": "Cluster A 2"}
+    result = plugin_module._plot_result_payload(
+        "Best location found: {}. Cluster A 2 is in the current system already.",
+        {"system": "Cluster", "body": "Cluster A 2"},
+        target,
+        {"Location": {"StarSystem": "Cluster"}},
+    )
+
+    assert result["success"] is False
+    assert result["verified"] is True
+    assert result["route_verified"] is False
+    assert result["navigation_verified"] is True
+    assert result["status"] == "body_resolved_not_selected"
+
+
+def test_status_and_queue_only_set_surface_live_route_mismatch(tmp_path) -> None:
+    plugin, plotted = make_plugin(tmp_path)
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+    context = {
+        "Location": {"StarSystem": "Start"},
+        "NavInfo": {
+            "NextJumpTarget": "Wrong Hop",
+            "NavRoute": [{"StarSystem": "Wrong Hop"}, {"StarSystem": "Wrong Destination"}],
+        },
+    }
+
+    status = json.loads(plugin._control_expedition(
+        plugin_module.ExpeditionControlParameters(operation="status"), context
+    ))
+    selected = json.loads(plugin._control_expedition(
+        plugin_module.ExpeditionControlParameters(operation="set", index=3, plot=False), context
+    ))
+
+    assert status["plot_requested"] is False
+    assert status["route_verified"] is False
+    assert status["navigation_state"] == "route_target_mismatch"
+    assert status["route_destination"] == "Wrong Destination"
+    assert selected["route_verified"] is False
+    assert selected["navigation_state"] == "route_target_mismatch"
+    assert selected["route_destination"] == "Wrong Destination"
+    assert plotted == []
+
+
+def test_status_context_separates_queue_target_route_hops_and_planning_distance(tmp_path) -> None:
+    plugin, _plotted = make_plugin(tmp_path)
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({
+        "version": 2,
+        "strategy": "stratum_sniping",
+        "source_system": "Start",
+        "index": 2,
+        "targets": queue,
+    })
+
+    title, status = plugin._expedition_status({
+        "Location": {"StarSystem": "Cluster"},
+        "NavInfo": {
+            "NextJumpTarget": "Transit",
+            "NavRoute": [
+                {"StarSystem": "Transit"},
+                {"StarSystem": "Singleton"},
+            ],
+        },
+    })[0]
+
+    assert title == "Active exobiology expedition"
+    assert status["queue_index"] == 3
+    assert status["queue_progress"] == "3/3"
+    assert status["planning_source_system"] == "Start"
+    assert status["target_system"] == "Singleton"
+    assert status["target_body"] == "Singleton 4"
+    assert status["distance_from_planning_source_ly"] == 55.0
+    assert status["navigation_state"] == "verified_route_to_target"
+    assert status["route_next_hop"] == "Transit"
+    assert status["route_destination"] == "Singleton"
+    assert status["remaining_jumps"] == 2
+    assert status["next_jump_target"] == "Transit"
+    assert "one-based index" in status["control"]
+
+
+def test_status_context_calls_out_route_target_mismatch(tmp_path) -> None:
+    plugin, _plotted = make_plugin(tmp_path)
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 2, "targets": queue})
+
+    _title, status = plugin._expedition_status({
+        "Location": {"StarSystem": "Cluster"},
+        "NavInfo": {
+            "NextJumpTarget": "Wrong Hop",
+            "NavRoute": [{"StarSystem": "Wrong Hop"}, {"StarSystem": "Wrong Destination"}],
+        },
+    })[0]
+
+    assert status["target_system"] == "Singleton"
+    assert status["route_destination"] == "Wrong Destination"
+    assert status["navigation_state"] == "route_target_mismatch"
+
+
+def test_french_exploration_station_lookup_prefers_science_officer(tmp_path, monkeypatch) -> None:
+    guide = tmp_path / "elite-hcs-astra" / "SKILL.md"
+    guide.parent.mkdir(parents=True)
+    guide.write_text(
+        "# Crew stations\nThe documented exploration station is `science officer`; "
+        "`away missions` is only the Odyssey on-foot suit station.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(plugin_module, "_knowledge_root", lambda: tmp_path)
+
+    result = json.loads(plugin_module._guide_lookup(
+        plugin_module.GuideLookupParameters(query="Quel est le nom de la station d'exploration pour Astra ?"),
+        {},
+    ))
+
+    assert result["verified"] is True
+    assert "science officer" in result["evidence"][0]["content"]
+    assert "away missions" in result["evidence"][0]["content"]
+
+
+def test_knowledge_root_prefers_explicit_environment_override(tmp_path, monkeypatch) -> None:
+    explicit = tmp_path / "custom-elite-guide"
+    explicit.mkdir()
+    monkeypatch.setenv("COVAS_ELITE_GUIDE_PATH", str(explicit))
+
+    assert plugin_module._knowledge_root() == explicit
+
+
+def test_knowledge_root_finds_deployed_windows_guide(tmp_path, monkeypatch) -> None:
+    deployed = tmp_path / "com.covas-next.ui" / "managed-guides" / "elite"
+    deployed.mkdir(parents=True)
+    monkeypatch.delenv("COVAS_ELITE_GUIDE_PATH", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    assert plugin_module._knowledge_root() == deployed
+
+
+def test_knowledge_root_uses_tracked_guide_during_development(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("COVAS_ELITE_GUIDE_PATH", raising=False)
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.setattr(plugin_module.Path, "home", classmethod(lambda cls: tmp_path / "empty-home"))
+    monkeypatch.chdir(tmp_path)
+
+    assert plugin_module._knowledge_root() == ROOT / "guides" / "elite"

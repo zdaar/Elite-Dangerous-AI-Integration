@@ -157,8 +157,8 @@ def _outward_search_center(
     Searching a sphere centred on the current position at ~1,800 ly returns a
     large number of stale records that other commanders have already visited.
     If the current direction from Sol is known, continue on that same radial
-    line and centre the search far enough out that the near edge of the normal
-    500 ly search is at about 3,000 ly from Sol.
+    line in routeable stages until the commander reaches the higher-confidence
+    region beyond 3,000 ly.
     """
     if source_coords is None:
         return None, False
@@ -168,7 +168,17 @@ def _outward_search_center(
     if source_distance >= HIGH_CONFIDENCE_DISTANCE_FROM_SOL_LY:
         return dict(source_coords), False
 
-    target_distance = HIGH_CONFIDENCE_DISTANCE_FROM_SOL_LY + min(float(radius), 500.0)
+    # Keep every candidate inside a routeable leg even when the commander has
+    # the galaxy map set to economical routing (which refuses routes over
+    # 1,000 ly).  The body-search sphere can extend `radius` ly beyond its
+    # centre, so move the centre only far enough that the complete sphere stays
+    # below 900 ly from the live position. Repeated expeditions still progress
+    # outward until the high-confidence region is reached.
+    max_center_step = max(100.0, 900.0 - min(float(radius), 800.0))
+    target_distance = min(
+        HIGH_CONFIDENCE_DISTANCE_FROM_SOL_LY + min(float(radius), 500.0),
+        source_distance + max_center_step,
+    )
     scale = target_distance / source_distance
     return {
         axis: float(source_coords[axis]) * scale
@@ -677,12 +687,19 @@ def plan_exobiology(
         )
         search_center = source_coords
         outward_staging = False
+        search_radius = radius
     else:
-        search_center, outward_staging = _outward_search_center(source_coords, radius)
+        # While staging outward, keep the entire query sphere within 900 ly of
+        # the live position so every returned first leg remains routeable under
+        # Elite's economical-route limit. Preserve larger user radii once the
+        # ship has reached the high-confidence region.
+        staged_radius = min(radius, 800)
+        search_center, outward_staging = _outward_search_center(source_coords, staged_radius)
+        search_radius = staged_radius if outward_staging else radius
         plan = plan_first_discovery(
             source_system,
             jump_range,
-            radius=radius,
+            radius=search_radius,
             max_results=max_results,
             source_coords=source_coords,
             reference_coords=search_center,
@@ -723,7 +740,8 @@ def plan_exobiology(
         "source_system": source_system or "Unknown",
         "source_coords": source_coords,
         "jump_range": jump_range,
-        "radius_ly": radius,
+        "radius_ly": search_radius,
+        "requested_radius_ly": radius,
         "max_arrival_ls": max_arrival_ls,
         "search_center_coords": search_center,
         "outward_staging_applied": outward_staging,

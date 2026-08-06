@@ -32,6 +32,36 @@ python -m pytest --timeout 10 test -v
 npm --prefix ui run build
 ```
 
+## One-command release build
+
+The fork includes a repeatable release script. From PowerShell in the repository root:
+
+```powershell
+.\scripts\build-windows-release.ps1
+```
+
+It installs locked dependencies, runs the Python regression suite, rebuilds the
+PyInstaller backend, builds the Angular UI, creates `dist\win-unpacked`, and packages
+the MSI. For an already-provisioned checkout, use `-SkipInstall`; use `-SkipMsi` while
+iterating locally. `-SkipInstall` requires Windows-native npm dependencies. If the
+checkout was last provisioned from WSL/Linux, run once without `-SkipInstall` so
+Angular receives the Windows `esbuild` binary. The script rejects that mixed-platform
+state before packaging.
+
+Each release pass recreates `dist\win-unpacked` instead of updating it in place. This
+prevents retired resources, local backup files, or an old `app.asar` from leaking into
+the next package.
+
+The packaged application also carries the fork's managed plugins and synchronizes them
+to `%APPDATA%\com.covas-next.ui\plugins` before the backend starts. This keeps the
+exobiology tools in step with the executable after an install or update.
+
+The verified Elite guide is packaged separately and synchronized to
+`%APPDATA%\com.covas-next.ui\managed-guides\elite`. It contains the tracked
+`guides\elite` Markdown tree used by `lookup_elite_guide`; it does not read or modify
+character profiles or `config.json`. Set `COVAS_ELITE_GUIDE_PATH` before launching to
+use a different guide tree. An explicit override takes precedence over the managed copy.
+
 ## Build the Python backend
 
 ```powershell
@@ -76,4 +106,3 @@ The option is disabled by default to avoid retaining speech unnecessarily.
 ## Installing a locally built backend for testing
 
 Close COVAS:NEXT before replacing backend files. Back up the existing `resources\Chat` directory, then replace it with the complete newly built `dist\Chat` directory. Do not replace only `Chat.exe`; mixed executable and `_internal` versions are not supported.
-

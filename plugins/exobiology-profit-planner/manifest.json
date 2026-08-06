@@ -1,8 +1,8 @@
 {
   "guid": "ad63b62a-666d-4aed-97df-ade8d21d5134",
   "name": "Exobiology Profit Planner",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "zdaar",
-  "description": "Plans targeted pre-Odyssey Stratum leads or confirmed-throughput routes, with a persistent exact-body queue and no full-system FSS requirement.",
+  "description": "Plans targeted pre-Odyssey Stratum leads or confirmed-throughput routes, with a persistent exact-body queue, explicit 1-based index control, verified route state, and no full-system FSS requirement.",
   "entrypoint": "plugin.py"
 }

@@ -99,6 +99,157 @@ const config = isDevelopment ? {
   backend_args: [],
 }
 
+async function pathExists(candidatePath) {
+  try {
+    await fsPromises.access(candidatePath);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function replaceManagedDirectory(staging, destination) {
+  const backup = `${destination}.managed-backup`;
+
+  // Recover the last known-good copy if a previous process stopped between
+  // moving the live directory aside and publishing its staged replacement.
+  if (!(await pathExists(destination)) && await pathExists(backup)) {
+    await fsPromises.rename(backup, destination);
+  } else {
+    await fsPromises.rm(backup, { recursive: true, force: true });
+  }
+
+  const hadDestination = await pathExists(destination);
+  if (hadDestination) {
+    await fsPromises.rename(destination, backup);
+  }
+  try {
+    await fsPromises.rename(staging, destination);
+  } catch (error) {
+    if (hadDestination && !(await pathExists(destination)) && await pathExists(backup)) {
+      await fsPromises.rename(backup, destination);
+    }
+    throw error;
+  }
+  await fsPromises.rm(backup, { recursive: true, force: true });
+}
+
+async function syncManagedPlugins() {
+  if (isDevelopment) {
+    return;
+  }
+
+  const bundledPluginsPath = path.join(process.resourcesPath, 'managed-plugins');
+  // PluginManager resolves ./plugins from the backend working directory. On
+  // Windows this is userData; Flatpak/Linux uses its XDG data directory.
+  const installedPluginsPath = path.join(config.backend_cwd, 'plugins');
+  const manifestPath = path.join(config.backend_cwd, 'managed-plugins.json');
+  let entries;
+  try {
+    entries = await fsPromises.readdir(bundledPluginsPath, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      logger.warn('Failed to inspect managed plugins:', error);
+    }
+    return;
+  }
+
+  const managedNames = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  let previousNames = [];
+  try {
+    const manifest = JSON.parse(await fsPromises.readFile(manifestPath, 'utf8'));
+    if (Array.isArray(manifest?.plugins)) {
+      previousNames = manifest.plugins.filter(
+        (name) => typeof name === 'string' && name && path.basename(name) === name,
+      );
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      logger.warn('Failed to read managed plugin manifest; rebuilding it:', error);
+    }
+  }
+
+  try {
+    await fsPromises.mkdir(installedPluginsPath, { recursive: true });
+
+    // Remove only plugins recorded as managed by an earlier release. Unrelated
+    // user-installed plugins in the same parent directory are never touched.
+    const retiredStillPresent = [];
+    for (const staleName of previousNames.filter((name) => !managedNames.includes(name))) {
+      try {
+        await fsPromises.rm(path.join(installedPluginsPath, staleName), {
+          recursive: true,
+          force: true,
+        });
+      } catch (error) {
+        logger.warn('Failed to remove retired managed plugin:', staleName, error);
+        // Keep it in the manifest so a later startup retries the cleanup.
+        retiredStillPresent.push(staleName);
+      }
+    }
+
+    for (const name of managedNames) {
+      const source = path.join(bundledPluginsPath, name);
+      const destination = path.join(installedPluginsPath, name);
+      const staging = path.join(installedPluginsPath, `.${name}.managed-${process.pid}`);
+      try {
+        await fsPromises.rm(staging, { recursive: true, force: true });
+        await fsPromises.cp(source, staging, { recursive: true, force: true });
+        await replaceManagedDirectory(staging, destination);
+        logger.info('Synchronized managed plugin:', name);
+      } catch (error) {
+        logger.warn('Failed to synchronize managed plugin; continuing startup:', name, error);
+        await fsPromises.rm(staging, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+
+    const manifestStaging = `${manifestPath}.next-${process.pid}`;
+    await fsPromises.writeFile(
+      manifestStaging,
+      JSON.stringify({ version: 1, plugins: [...managedNames, ...retiredStillPresent] }, null, 2),
+      'utf8',
+    );
+    await fsPromises.rm(manifestPath, { force: true });
+    await fsPromises.rename(manifestStaging, manifestPath);
+  } catch (error) {
+    // Managed content is optional. A locked or read-only user-data directory
+    // must never prevent the main window and backend from starting.
+    logger.warn('Failed to synchronize managed plugins; continuing startup:', error);
+  }
+}
+
+function getManagedEliteGuidePath() {
+  return path.join(app.getPath('userData'), 'managed-guides', 'elite');
+}
+
+async function syncManagedEliteGuides() {
+  if (isDevelopment) {
+    return;
+  }
+
+  const bundledGuidePath = path.join(process.resourcesPath, 'managed-guides', 'elite');
+  const installedGuidePath = getManagedEliteGuidePath();
+  const stagingGuidePath = `${installedGuidePath}.next-${process.pid}`;
+  try {
+    await fsPromises.access(bundledGuidePath);
+    await fsPromises.mkdir(path.dirname(installedGuidePath), { recursive: true });
+    await fsPromises.rm(stagingGuidePath, { recursive: true, force: true });
+    await fsPromises.cp(bundledGuidePath, stagingGuidePath, { recursive: true, force: true });
+    await replaceManagedDirectory(stagingGuidePath, installedGuidePath);
+    logger.info('Synchronized managed Elite guide:', installedGuidePath);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      logger.warn('Failed to synchronize managed Elite guide; continuing startup:', error);
+    }
+    await fsPromises.rm(stagingGuidePath, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 function getOverlayUrl(opts = {}) {
   const overlayUrl = new URL(config.overlay);
   if (overlayUrl.hash) {
@@ -266,6 +417,17 @@ protocol.registerSchemesAsPrivileged([
       standard: true,
       corsEnabled: false,
     }
+  },
+  {
+    scheme: 'user-asset',
+    privileges: {
+      secure: true,
+      supportFetchAPI: true,
+      standard: true,
+      // AvatarService fetches this scheme from the app:// renderer for SVG
+      // previews and config backups. Electron treats that as cross-origin.
+      corsEnabled: true,
+    }
   }
 ]);
 
@@ -358,6 +520,27 @@ async function assertUserAssetPath(filePath) {
     throw new Error('User asset path is outside the managed directory');
   }
   return resolvedPath;
+}
+
+async function getUserAssetFileInfo(filePath) {
+  const resolvedPath = resolveReadableAssetPath(filePath);
+  const stats = await fsPromises.stat(resolvedPath);
+  if (!stats.isFile()) {
+    throw new Error('Asset path is not a file');
+  }
+
+  const userAssetsDir = await ensureUserAssetsDirectory();
+  const normalizedPath = process.platform === 'win32' ? resolvedPath.toLowerCase() : resolvedPath;
+  const resolvedDir = path.resolve(userAssetsDir);
+  const normalizedDir = process.platform === 'win32' ? resolvedDir.toLowerCase() : resolvedDir;
+  const managed = normalizedPath === normalizedDir || normalizedPath.startsWith(normalizedDir + path.sep);
+
+  return {
+    path: resolvedPath,
+    mimeType: getMimeTypeForUserAsset(resolvedPath),
+    managed,
+    size: stats.size,
+  };
 }
 
 async function resolveManagedUserAssetPath(filePath) {
@@ -488,13 +671,12 @@ class BackendService {
   detachRemoteClient(client) {
     this.#remoteClients.delete(client);
   }
-  startProcess(mainWindow) {
-    this.attachWindow(mainWindow);
+  async startProcess(mainWindow) {
     if (this.#hasActiveProcess()) {
       logger.warn('Process is already running, stopping it first');
-      this.#stopRequestedPid = this.#currentProcess.pid ?? null;
-      this.#currentProcess.kill('SIGINT');
+      await this.stopProcess(mainWindow);
     }
+    this.attachWindow(mainWindow);
     logger.info('Starting process:', config.backend);
 
     const childProcess = spawn(config.backend, config.backend_args, {
@@ -502,6 +684,9 @@ class BackendService {
       cwd: config.backend_cwd,
       env: {
         ...process.env, // inherit environment variables
+        // Respect a user override; otherwise point the backend at the guide
+        // deployed beside its other managed runtime data.
+        COVAS_ELITE_GUIDE_PATH: process.env.COVAS_ELITE_GUIDE_PATH || getManagedEliteGuidePath(),
         // set unbuffered python
         PYTHONUNBUFFERED: 1,
       }
@@ -613,19 +798,74 @@ class BackendService {
     });
 
     mainWindow.on('close', () => {
-      this.stopProcess(mainWindow);
+      void this.stopProcess(mainWindow).catch((error) => {
+        logger.warn('Failed to stop backend while closing the main window:', error);
+      });
       // remove all stdin and stdout listeners
       childProcess.stdout.removeAllListeners('data');
       childProcess.stderr.removeAllListeners('data');
     });
   }
-  stopProcess(mainWindow) {
+  async stopProcess(mainWindow) {
     this.detachWindow(mainWindow);
-    if (this.#hasActiveProcess()) {
-      logger.info('Stopping process:', this.#currentProcess.pid);
-      this.#stopRequestedPid = this.#currentProcess.pid ?? null;
-      this.#currentProcess.kill('SIGINT');
+    if (!this.#hasActiveProcess()) {
+      return;
     }
+
+    const childProcess = this.#currentProcess;
+    logger.info('Stopping process:', childProcess.pid);
+    this.#stopRequestedPid = childProcess.pid ?? null;
+
+    await new Promise((resolve, reject) => {
+      let forceKillTimer = null;
+      let forceKillDeadline = null;
+
+      const cleanup = () => {
+        childProcess.removeListener('close', onClose);
+        childProcess.removeListener('error', onError);
+        if (forceKillTimer) clearTimeout(forceKillTimer);
+        if (forceKillDeadline) clearTimeout(forceKillDeadline);
+      };
+      const finish = (error = null) => {
+        cleanup();
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const onClose = () => finish();
+      const onError = (error) => finish(error);
+
+      childProcess.once('close', onClose);
+      childProcess.once('error', onError);
+
+      try {
+        childProcess.kill('SIGINT');
+      } catch (error) {
+        finish(error);
+        return;
+      }
+
+      // Do not leave the renderer stuck in its "Stopping" state forever if a
+      // backend or one of its children ignores the graceful signal.
+      forceKillTimer = setTimeout(() => {
+        if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
+          finish();
+          return;
+        }
+        logger.warn('Backend did not stop after SIGINT; forcing termination:', childProcess.pid);
+        try {
+          childProcess.kill('SIGKILL');
+        } catch (error) {
+          finish(error);
+          return;
+        }
+        forceKillDeadline = setTimeout(() => {
+          finish(new Error(`Backend process ${childProcess.pid ?? 'unknown'} did not terminate`));
+        }, 2000);
+      }, 5000);
+    });
   } 
 }
 
@@ -1124,6 +1364,19 @@ function getRemoteInterfaceState() {
 
 app.whenReady().then(async ()=>{
 
+  await syncManagedPlugins();
+  await syncManagedEliteGuides();
+
+  // Stream managed avatar files directly to Chromium. Returning large images
+  // as base64 over ipcRenderer can exceed Electron's IPC message limit (an
+  // animated 12 MB PNG expands to roughly 16 MB before protocol overhead).
+  protocol.handle('user-asset', async (request) => {
+    const requestUrl = new URL(request.url);
+    const exactPath = requestUrl.searchParams.get('path');
+    const assetPath = await assertUserAssetPath(exactPath);
+    return net.fetch(url.pathToFileURL(assetPath).toString());
+  });
+
   protocol.handle('app', (request) => {
     const requestUrl = new URL(request.url);
     const resolved = url.pathToFileURL(path.join(import.meta.dirname, './ui/', requestUrl.pathname)).toString()
@@ -1273,6 +1526,9 @@ app.whenReady().then(async ()=>{
       dataBase64: buffer.toString('base64'),
     };
   });
+  ipcMain.handle('get_user_asset_file_info', async (event, opts) => {
+    return getUserAssetFileInfo(opts?.path);
+  });
   ipcMain.handle('list_user_asset_files', async () => {
     const userAssetsDir = await ensureUserAssetsDirectory();
     const entries = await fsPromises.readdir(userAssetsDir, { withFileTypes: true });
@@ -1316,7 +1572,9 @@ app.whenReady().then(async ()=>{
       disposeOverlay(floatingOverlay, backend);
       floatingOverlay = null;
     }
-    backend.stopProcess(mainWindow);
+    void backend.stopProcess(mainWindow).catch((error) => {
+      logger.warn('Failed to stop backend after the main window closed:', error);
+    });
     void stopRemoteInterface();
     if (process.platform !== 'darwin') {
       app.quit();

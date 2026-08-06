@@ -894,17 +894,21 @@ class Config(TypedDict):
     commander_name: str
     characters: List[Character]
     active_character_index: int
-    llm_provider: Literal['openai', 'openrouter','google-ai-studio', 'custom', 'local-ai-server']
+    llm_provider: Literal['openai', 'openai-chatgpt', 'openrouter','google-ai-studio', 'custom', 'local-ai-server']
     llm_model_name: str
-    llm_reasoning_effort: Literal['default', 'none', 'minimal', 'low', 'medium', 'high'] | None
+    llm_reasoning_effort: Literal['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] | None
+    llm_text_verbosity: Literal['default', 'low', 'medium', 'high'] | None
     llm_temperature: float
-    agent_llm_provider: Literal['openai', 'openrouter','google-ai-studio', 'custom', 'local-ai-server']
+    agent_llm_provider: Literal['openai', 'openai-chatgpt', 'openrouter','google-ai-studio', 'custom', 'local-ai-server']
     agent_llm_model_name: str
-    agent_llm_reasoning_effort: Literal['default', 'none', 'minimal', 'low', 'medium', 'high'] | None
+    agent_llm_reasoning_effort: Literal['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] | None
+    agent_llm_text_verbosity: Literal['default', 'low', 'medium', 'high'] | None
     agent_llm_endpoint: str
     agent_llm_api_key: str
     agent_llm_temperature: float
     agent_llm_max_tries: int
+    codex_app_server_command: str
+    codex_app_server_timeout: int
     mute_search: bool
     vision_provider: Literal['openai', 'google-ai-studio', 'custom', 'none', 'local-ai-server']
     vision_model_name: str
@@ -1354,6 +1358,15 @@ def migrate(data: dict) -> dict:
         data.setdefault('tts_debug_capture_enabled', False)
         data['config_version'] = 20
 
+    if data['config_version'] < 21:
+        # Add model-output controls and the optional managed ChatGPT OAuth
+        # transport without changing an existing provider or model selection.
+        data.setdefault('llm_text_verbosity', 'low')
+        data.setdefault('agent_llm_text_verbosity', 'low')
+        data.setdefault('codex_app_server_command', 'codex')
+        data.setdefault('codex_app_server_timeout', 120)
+        data['config_version'] = 21
+
     return data
 
 
@@ -1456,7 +1469,7 @@ def getDefaultCharacter(config: Config) -> Character:
 
 def load_config() -> Config:
     defaults: Config = {
-        'config_version': 20,
+        'config_version': 21,
         'commander_name': "",
         'characters': [],
         'active_character_index': 0,  # -1 means using the default legacy character
@@ -1489,16 +1502,20 @@ def load_config() -> Config:
         'llm_provider': "openai",
         'llm_model_name': "gpt-5.4-nano",
         'llm_reasoning_effort': 'none',
+        'llm_text_verbosity': 'low',
         'llm_endpoint': "https://api.openai.com/v1",
         'llm_api_key': "",
         'llm_temperature': 1.0,
         'agent_llm_provider': "openai",
         'agent_llm_model_name': "gpt-5.4-mini",
         'agent_llm_reasoning_effort': 'low',
+        'agent_llm_text_verbosity': 'low',
         'agent_llm_endpoint': "https://api.openai.com/v1",
         'agent_llm_api_key': "",
         'agent_llm_temperature': 1.0,
         'agent_llm_max_tries': 7,
+        'codex_app_server_command': 'codex',
+        'codex_app_server_timeout': 120,
         'mute_search': False,
         'ptt_key': '',
         'ptt_key_secondary': '',
@@ -1813,6 +1830,33 @@ def update_config(config: Config, data: dict) -> Config:
             data["llm_api_key"] = ""
             data["tools_var"] = True
             data["llm_reasoning_effort"] = 'none'
+            data["llm_text_verbosity"] = 'low'
+
+        elif data["llm_provider"] == "openai-chatgpt":
+            data["llm_endpoint"] = ""
+            data["llm_model_name"] = "gpt-5.6-terra"
+            data["llm_api_key"] = ""
+            data["tools_var"] = True
+            data["llm_reasoning_effort"] = 'low'
+            data["llm_text_verbosity"] = 'low'
+            # ChatGPT OAuth covers app-server model calls, not the public
+            # embeddings API. Disable only embeddings that relied on the
+            # public OpenAI key; preserve an independently configured Google,
+            # custom, or local embedding provider.
+            incoming_embedding = data.get("embedding_provider")
+            current_embedding = config.get("embedding_provider")
+            incoming_embedding_key = data.get("embedding_api_key")
+            effective_embedding_key = (
+                incoming_embedding_key
+                if incoming_embedding_key is not None
+                else config.get("embedding_api_key")
+            )
+            has_independent_embedding_key = bool(str(effective_embedding_key or "").strip())
+            if (
+                incoming_embedding == "openai"
+                or (incoming_embedding is None and current_embedding == "openai")
+            ) and not has_independent_embedding_key:
+                data["embedding_provider"] = 'none'
 
         elif data["llm_provider"] == "openrouter":
             data["llm_endpoint"] = "https://openrouter.ai/api/v1/"
@@ -1848,6 +1892,14 @@ def update_config(config: Config, data: dict) -> Config:
             data["agent_llm_model_name"] = "gpt-5.4-mini"
             data["agent_llm_api_key"] = ""
             data["agent_llm_reasoning_effort"] = 'low'
+            data["agent_llm_text_verbosity"] = 'low'
+
+        elif data["agent_llm_provider"] == "openai-chatgpt":
+            data["agent_llm_endpoint"] = ""
+            data["agent_llm_model_name"] = "gpt-5.6-terra"
+            data["agent_llm_api_key"] = ""
+            data["agent_llm_reasoning_effort"] = 'low'
+            data["agent_llm_text_verbosity"] = 'low'
 
         elif data["agent_llm_provider"] == "openrouter":
             data["agent_llm_endpoint"] = "https://openrouter.ai/api/v1/"
@@ -1881,6 +1933,13 @@ def update_config(config: Config, data: dict) -> Config:
         if agent_tries < 1:
             agent_tries = 1
         data["agent_llm_max_tries"] = agent_tries
+
+    if data.get("codex_app_server_timeout") is not None:
+        try:
+            codex_timeout = int(data["codex_app_server_timeout"])
+        except (ValueError, TypeError):
+            codex_timeout = int(config.get("codex_app_server_timeout", 120))
+        data["codex_app_server_timeout"] = max(1, min(900, codex_timeout))
 
     if data.get("vision_provider"):
         if data["vision_provider"] == "openai":
@@ -1986,7 +2045,8 @@ def update_config(config: Config, data: dict) -> Config:
         if data["embedding_provider"] == "openai":
             data["embedding_endpoint"] = "https://api.openai.com/v1"
             data["embedding_model_name"] = "text-embedding-3-small"
-            data["embedding_api_key"] = ""
+            if "embedding_api_key" not in data and config.get("embedding_provider") != "openai":
+                data["embedding_api_key"] = ""
 
         elif data["embedding_provider"] == "google-ai-studio":
             data["embedding_endpoint"] = "https://generativelanguage.googleapis.com/v1beta"

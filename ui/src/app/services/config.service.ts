@@ -80,27 +80,33 @@ export interface Config {
     // Other config settings
     llm_provider:
         | "openai"
+        | "openai-chatgpt"
         | "openrouter"
         | "google-ai-studio"
         | "custom"
         | "local-ai-server";
     llm_model_name: string;
-    llm_reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | null;
+    llm_reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null;
+    llm_text_verbosity: 'default' | 'low' | 'medium' | 'high' | null;
     llm_api_key: string;
     llm_endpoint: string;
     llm_temperature: number;
     agent_llm_provider:
         | "openai"
+        | "openai-chatgpt"
         | "openrouter"
         | "google-ai-studio"
         | "custom"
         | "local-ai-server";
     agent_llm_model_name: string;
-    agent_llm_reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | null;
+    agent_llm_reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null;
+    agent_llm_text_verbosity: 'default' | 'low' | 'medium' | 'high' | null;
     agent_llm_api_key: string;
     agent_llm_endpoint: string;
     agent_llm_temperature: number;
     agent_llm_max_tries: number;
+    codex_app_server_command: string;
+    codex_app_server_timeout: number;
     mute_search: boolean;
     vision_provider: "openai" | "google-ai-studio" | "custom" | "none" | "local-ai-server";
     vision_model_name: string;

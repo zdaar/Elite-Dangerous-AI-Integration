@@ -50,6 +50,22 @@
       {
         "from": "dist/Chat",
         "to": "Chat"
+      },
+      {
+        "from": "plugins",
+        "to": "managed-plugins",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
+        ]
+      },
+      {
+        "from": "guides/elite",
+        "to": "managed-guides/elite",
+        "filter": [
+          "**/*.md"
+        ]
       }
     ],
     "files": [

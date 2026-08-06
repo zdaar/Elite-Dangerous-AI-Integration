@@ -211,6 +211,113 @@ def test_openai_responses_model_usage_captures_reasoning_tokens(
     assert usage.output_chars == 2
 
 
+def test_openai_terra_low_sends_reasoning_and_verbosity_without_temperature(
+    monkeypatch,
+) -> None:
+    response = SimpleNamespace(
+        usage=None,
+        output_text="ok",
+        output=[],
+        error=None,
+    )
+    create = MagicMock(return_value=response)
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=create),
+        models=SimpleNamespace(list=MagicMock(return_value=[])),
+    )
+    monkeypatch.setattr("src.lib.Models.OpenAI", lambda **kwargs: client)
+
+    model = OpenAIResponsesLLMModel(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model_name="gpt-5.6-terra",
+        temperature=0.7,
+        reasoning_effort="low",
+        text_verbosity="low",
+        provider_name="openai",
+    )
+    model.generate([{"role": "user", "content": "Plot the next target"}])
+
+    params = create.call_args.kwargs
+    assert params["model"] == "gpt-5.6-terra"
+    assert params["reasoning"] == {"effort": "low"}
+    assert params["text"] == {"verbosity": "low"}
+    assert "temperature" not in params
+
+
+def test_openai_non_reasoning_responses_model_keeps_temperature(monkeypatch) -> None:
+    response = SimpleNamespace(
+        usage=None,
+        output_text="ok",
+        output=[],
+        error=None,
+    )
+    create = MagicMock(return_value=response)
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=create),
+        models=SimpleNamespace(list=MagicMock(return_value=[])),
+    )
+    monkeypatch.setattr("src.lib.Models.OpenAI", lambda **kwargs: client)
+
+    model = OpenAIResponsesLLMModel(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model_name="gpt-4.1-mini",
+        temperature=0.3,
+        text_verbosity="low",
+        provider_name="openai",
+    )
+    model.generate([{"role": "user", "content": "Hello"}])
+
+    assert create.call_args.kwargs["temperature"] == 0.3
+    assert "text" not in create.call_args.kwargs
+
+
+def test_openai_terra_explicit_none_reasoning_is_not_dropped(monkeypatch) -> None:
+    response = SimpleNamespace(usage=None, output_text="ok", output=[], error=None)
+    create = MagicMock(return_value=response)
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=create),
+        models=SimpleNamespace(list=MagicMock(return_value=[])),
+    )
+    monkeypatch.setattr("src.lib.Models.OpenAI", lambda **kwargs: client)
+
+    model = OpenAIResponsesLLMModel(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model_name="gpt-5.6-terra",
+        temperature=1.0,
+        reasoning_effort="none",
+    )
+    model.generate([{"role": "user", "content": "Hello"}])
+
+    assert create.call_args.kwargs["reasoning"] == {"effort": "none"}
+
+
+def test_responses_history_repairs_legacy_tool_output_order() -> None:
+    model = object.__new__(OpenAIResponsesLLMModel)
+    converted = model._convert_messages(
+        [
+            {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "probe", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+    )
+
+    assert [item["type"] for item in converted] == [
+        "function_call",
+        "function_call_output",
+    ]
+
+
 def test_get_reasoning_tokens_falls_back_to_usage_totals() -> None:
     usage = SimpleNamespace(
         prompt_tokens=100,

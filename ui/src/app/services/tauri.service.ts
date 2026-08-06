@@ -20,6 +20,7 @@ declare global {
             confirmWindowClose: () => Promise<void>;
             userAssets?: {
                 writeFile?: (opts: any) => Promise<any>;
+                getFileInfo?: (opts: any) => Promise<any>;
                 readFile?: (opts: any) => Promise<any>;
                 listFiles?: () => Promise<any>;
                 deleteFile?: (opts: any) => Promise<any>;
@@ -601,6 +602,9 @@ export class TauriService {
             return [];
         }
         await this.stopExe();
+        return this.startExe();
+    }
+    private async startExe(): Promise<string[]> {
         try {
             const output: string[] = await this.transport.invoke("start_process", {});
             this.startReadingOutput();
@@ -626,12 +630,21 @@ export class TauriService {
             await this.transport.invoke("stop_process", {});
         } catch (error) {
             console.error("Error running exe:", error);
+            this.runModeSubject.next("error");
+            this.showErrorToast(
+                `Error stopping subprocess: ${
+                    error instanceof Error ? error.message : error
+                }`,
+            );
             throw error;
         }
     }
     public async restart_process(): Promise<void> {
+        if (this.transport.isRemote) {
+            return;
+        }
         await this.stopExe();
-        await this.runExe();
+        await this.startExe();
     }
     public async send_start_signal(): Promise<void> {
         if (this.runModeSubject.getValue() === "error") {

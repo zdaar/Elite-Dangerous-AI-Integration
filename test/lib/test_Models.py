@@ -1,4 +1,9 @@
-from src.lib.Models import OpenAITTSModel, create_tts_model
+from src.lib.Models import (
+    CodexAppServerLLMModel,
+    OpenAITTSModel,
+    create_llm_model,
+    create_tts_model,
+)
 
 
 def local_tts_config() -> dict:
@@ -32,3 +37,24 @@ def test_qwen_local_profile_can_disable_language_suffix() -> None:
     assert isinstance(model, OpenAITTSModel)
     assert str(model.client.base_url) == "http://speech-box:8005/v1/"
     assert model.model_name == "qwen3-tts"
+
+
+def test_chatgpt_oauth_provider_builds_terra_low_app_server_model() -> None:
+    model = create_llm_model(
+        "openai-chatgpt",
+        {
+            "api_key": "",
+            "llm_api_key": "",
+            "llm_model_name": "gpt-5.6-terra",
+            "llm_reasoning_effort": "low",
+            "llm_text_verbosity": "low",
+            "llm_temperature": 1.0,
+            "codex_app_server_command": "codex",
+            "codex_app_server_timeout": 120,
+        },
+    )
+
+    assert isinstance(model, CodexAppServerLLMModel)
+    assert model.model_name == "gpt-5.6-terra"
+    assert model.reasoning_effort == "low"
+    assert model.text_verbosity == "low"

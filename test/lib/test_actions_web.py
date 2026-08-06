@@ -1,4 +1,5 @@
 import json
+import importlib
 from pathlib import Path
 import sys
 
@@ -219,7 +220,7 @@ def test_ensure_in_system_plot_target_rejects_unlandable_body() -> None:
         raise AssertionError("Expected unlandable body to be rejected")
 
 
-def test_plot_candidates_from_bodies_skips_non_planets_and_requests_one_result(monkeypatch) -> None:
+def test_plot_candidates_from_bodies_skips_non_planets_and_preserves_exact_name(monkeypatch) -> None:
     captured_sizes: list[int] = []
     captured_names: list[str] = []
     captured_requests: list[dict] = []
@@ -260,9 +261,9 @@ def test_plot_candidates_from_bodies_skips_non_planets_and_requests_one_result(m
         }
     })
 
-    assert captured_sizes == [1]
-    assert captured_names == ["Eart?"]
-    assert captured_requests[0]["size"] == 1
+    assert captured_sizes == [10]
+    assert captured_names == ["Earth"]
+    assert captured_requests[0]["size"] == 10
     assert captured_requests[0]["sort"] == [{"distance": {"direction": "asc"}}]
     assert captured_requests[0]["reference_coords"] == {"x": 0, "y": 0, "z": 0}
     assert len(candidates) == 1
@@ -310,10 +311,10 @@ def test_plot_candidates_from_stations_requests_nearest_named_station(monkeypatc
     assert captured_requests[0] == {
         "filters": {
             "distance": {"min": "0", "max": "50000"},
-            "name": {"value": "Moskowitz Enterpris?"},
+            "name": {"value": "Moskowitz Enterprise"},
         },
         "sort": [{"distance": {"direction": "asc"}}],
-        "size": 1,
+        "size": 10,
         "page": 0,
         "reference_coords": {
             "x": -82.625,
@@ -332,14 +333,14 @@ def test_plot_search_query_prefers_station_then_body_then_system() -> None:
     assert actions_web.plot_search_query() is None
 
 
-def test_spansh_plot_search_name_disables_fuzzy_matching() -> None:
-    assert actions_web.spansh_plot_search_name("Earth") == "Eart?"
-    assert actions_web.spansh_plot_search_name("Sol") == "So?"
-    assert actions_web.spansh_plot_search_name("A") == "?"
+def test_spansh_plot_search_name_preserves_procedural_suffix() -> None:
+    assert actions_web.spansh_plot_search_name("Earth") == "Earth"
+    assert actions_web.spansh_plot_search_name("Synuefue KG-T c5-0") == "Synuefue KG-T c5-0"
+    assert actions_web.spansh_plot_search_name("A") == "A"
     assert actions_web.spansh_plot_search_name("") == ""
     assert actions_web._plot_search_obj("Jameson Memorial") == {
-        "name": "Jameson Memoria?",
-        "size": 1,
+        "name": "Jameson Memorial",
+        "size": 10,
     }
 
 
@@ -420,7 +421,7 @@ def test_resolve_plot_target_queries_all_spansh_endpoints(monkeypatch) -> None:
 
     def fake_post(url: str, request_body: dict) -> dict:
         posted_urls.append(url)
-        assert request_body["size"] == 1
+        assert request_body["size"] == 10
         assert request_body["sort"] == [{"distance": {"direction": "asc"}}]
         assert request_body["reference_system"] == "Alpha Centauri"
         if url == actions_web.SPANSH_SYSTEMS_URL:
@@ -433,7 +434,7 @@ def test_resolve_plot_target_queries_all_spansh_endpoints(monkeypatch) -> None:
 
     monkeypatch.setattr(actions_web, "_spansh_post", fake_post)
 
-    resolved = actions_web.lookup_plot_target(system="Sol", projected_states={"Location": {"StarSystem": "Alpha Centauri"}})
+    resolved = actions_web.resolve_plot_target("Sol", projected_states={"Location": {"StarSystem": "Alpha Centauri"}})
 
     assert sorted(posted_urls) == sorted([
         actions_web.SPANSH_BODIES_URL,
@@ -443,3 +444,87 @@ def test_resolve_plot_target_queries_all_spansh_endpoints(monkeypatch) -> None:
     assert resolved is not None
     assert resolved.target_type == "system"
     assert resolved.system_name == "Sol"
+
+
+def test_typed_system_lookup_rejects_suffix_neighbor_and_skips_other_endpoints(monkeypatch) -> None:
+    posted_urls: list[str] = []
+    captured_name_filters: list[str] = []
+
+    def fake_post(url: str, request_body: dict) -> dict:
+        posted_urls.append(url)
+        captured_name_filters.append(request_body["filters"]["name"]["value"])
+        return {"results": [{"name": "Synuefue KG-T c5-1", "distance": 0.0}]}
+
+    monkeypatch.setattr(actions_web, "_spansh_post", fake_post)
+
+    resolved = actions_web.lookup_plot_target(
+        system="Synuefue KG-T c5-0",
+        projected_states={"Location": {"StarSystem": "Synuefue KG-T c5-1"}},
+    )
+
+    assert posted_urls == [actions_web.SPANSH_SYSTEMS_URL]
+    assert captured_name_filters == ["Synuefue KG-T c5-0"]
+    assert resolved is None
+
+
+def test_typed_system_lookup_selects_only_exact_procedural_name(monkeypatch) -> None:
+    def fake_post(url: str, request_body: dict) -> dict:
+        assert url == actions_web.SPANSH_SYSTEMS_URL
+        return {"results": [
+            {"name": "Synuefue KG-T c5-1", "distance": 0.0},
+            {"name": "Synuefue KG-T c5-0", "distance": 12.0},
+        ]}
+
+    monkeypatch.setattr(actions_web, "_spansh_post", fake_post)
+
+    resolved = actions_web.lookup_plot_target(
+        system="Synuefue KG-T c5-0",
+        projected_states={"Location": {"StarSystem": "Synuefue KG-T c5-1"}},
+    )
+
+    assert resolved is not None
+    assert resolved.target_type == "system"
+    assert resolved.system_name == "Synuefue KG-T c5-0"
+
+
+def test_plot_uses_unchanged_system_without_spansh_resolution(monkeypatch) -> None:
+    plotter_module = importlib.import_module("src.lib.actions.Plotter")
+    monkeypatch.setattr(plotter_module, "set_game_window_active", lambda: None)
+
+    def prepare_system(obj, _states):
+        return {
+            "filters": {"name": {"value": obj["name"]}},
+            "sort": [],
+            "size": obj["size"],
+            "page": 0,
+        }
+
+    spansh_calls: list[str] = []
+
+    def unexpected_spansh(url, _request):
+        spansh_calls.append(url)
+        return {"results": [{"name": "Synuefue KG-T c5-1", "distance": 0.0}]}
+
+    plotter = actions_web.Plotter(
+        prepare_system_request=prepare_system,
+        spansh_post=unexpected_spansh,
+    )
+    plotted_systems: list[str] = []
+
+    def fake_plot(system_name, _details, _states, _key="GalaxyMapOpen", **_kwargs):
+        plotted_systems.append(system_name)
+        return f"Failed to plot a route to {system_name}"
+
+    monkeypatch.setattr(plotter, "_plot_galaxy_route", fake_plot)
+
+    result = plotter.plot_to_target(
+        {"system": "Synuefue KG-T c5-0"},
+        {
+            "Location": {"StarSystem": "Synuefue KG-T c5-1"},
+            "NavInfo": {"NavRoute": []},
+        },
+    )
+
+    assert spansh_calls == []
+    assert plotted_systems == ["Synuefue KG-T c5-0"]
+    assert result == "Failed to plot a route to Synuefue KG-T c5-0"

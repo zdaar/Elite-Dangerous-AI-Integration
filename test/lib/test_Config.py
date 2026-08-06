@@ -20,7 +20,7 @@ from src.lib.Config import (
 def test_migrate_empty_allowed_actions_enables_all_current_actions() -> None:
     migrated = migrate({"config_version": 18, "allowed_actions": []})
 
-    assert migrated["config_version"] == 20
+    assert migrated["config_version"] == 21
     assert migrated["allowed_actions"] == default_allowed_actions
     assert all(migrated["allowed_actions"].values())
 
@@ -84,7 +84,7 @@ def test_legacy_backup_update_runs_full_action_migration(monkeypatch) -> None:
         lambda config: None,
     )
     current = {
-        "config_version": 20,
+        "config_version": 21,
         "allowed_actions": default_allowed_actions.copy(),
     }
     legacy_backup = {
@@ -94,7 +94,7 @@ def test_legacy_backup_update_runs_full_action_migration(monkeypatch) -> None:
 
     updated = update_config(current, legacy_backup)  # type: ignore[arg-type]
 
-    assert updated["config_version"] == 20
+    assert updated["config_version"] == 21
     assert updated["allowed_actions"]["fireWeapons"] is True
     assert updated["allowed_actions"]["plotToTarget"] is True
     assert updated["allowed_actions"]["setSpeed"] is False
@@ -107,13 +107,83 @@ def test_migrate_adds_local_tts_settings_and_preserves_stt_language() -> None:
         "stt_language": "fr",
     })
 
-    assert migrated["config_version"] == 20
+    assert migrated["config_version"] == 21
     assert migrated["tts_language"] == "fr"
     assert migrated["tts_chatterbox_endpoint"] == "http://localhost:8004/v1"
     assert migrated["tts_qwen3_endpoint"] == "http://localhost:8005/v1"
     assert migrated["tts_append_language_to_model"] is True
     assert migrated["tts_warmup_enabled"] is False
     assert migrated["tts_debug_capture_enabled"] is False
+
+
+def test_migrate_adds_reasoning_output_and_codex_transport_settings_without_changing_provider() -> None:
+    migrated = migrate({
+        "config_version": 20,
+        "llm_provider": "custom",
+        "llm_model_name": "deepseek-chat",
+        "agent_llm_provider": "custom",
+        "agent_llm_model_name": "deepseek-chat",
+    })
+
+    assert migrated["config_version"] == 21
+    assert migrated["llm_provider"] == "custom"
+    assert migrated["llm_model_name"] == "deepseek-chat"
+    assert migrated["agent_llm_provider"] == "custom"
+    assert migrated["agent_llm_model_name"] == "deepseek-chat"
+    assert migrated["llm_text_verbosity"] == "low"
+    assert migrated["agent_llm_text_verbosity"] == "low"
+    assert migrated["codex_app_server_command"] == "codex"
+    assert migrated["codex_app_server_timeout"] == 120
+
+
+@pytest.mark.parametrize("embedding_provider", ["google-ai-studio", "custom", "local-ai-server"])
+def test_chatgpt_oauth_preserves_independent_embedding_provider(
+    monkeypatch,
+    embedding_provider: str,
+) -> None:
+    monkeypatch.setattr("src.lib.Config.emit_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.lib.Config.save_config", lambda config: None)
+    current = {
+        "config_version": 21,
+        "llm_provider": "custom",
+        "embedding_provider": embedding_provider,
+    }
+
+    updated = update_config(current, {"llm_provider": "openai-chatgpt"})  # type: ignore[arg-type]
+
+    assert updated["llm_provider"] == "openai-chatgpt"
+    assert updated["embedding_provider"] == embedding_provider
+
+
+def test_chatgpt_oauth_disables_public_openai_embeddings(monkeypatch) -> None:
+    monkeypatch.setattr("src.lib.Config.emit_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.lib.Config.save_config", lambda config: None)
+    current = {
+        "config_version": 21,
+        "llm_provider": "openai",
+        "embedding_provider": "openai",
+        "embedding_api_key": "",
+    }
+
+    updated = update_config(current, {"llm_provider": "openai-chatgpt"})  # type: ignore[arg-type]
+
+    assert updated["embedding_provider"] == "none"
+
+
+def test_chatgpt_oauth_preserves_openai_embeddings_with_an_independent_key(monkeypatch) -> None:
+    monkeypatch.setattr("src.lib.Config.emit_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.lib.Config.save_config", lambda config: None)
+    current = {
+        "config_version": 21,
+        "llm_provider": "custom",
+        "embedding_provider": "openai",
+        "embedding_api_key": "sk-independent-embedding",
+    }
+
+    updated = update_config(current, {"llm_provider": "openai-chatgpt"})  # type: ignore[arg-type]
+
+    assert updated["embedding_provider"] == "openai"
+    assert updated["embedding_api_key"] == "sk-independent-embedding"
 
 
 def test_action_defaults_match_registered_permissions() -> None:
