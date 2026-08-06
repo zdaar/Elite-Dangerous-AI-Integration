@@ -9,13 +9,18 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from threading import Thread
+from threading import RLock, Thread, Timer
 from time import monotonic
 from typing import Any, Callable
+import weakref
 
 
 class CodexAppServerError(RuntimeError):
     """Raised when the managed Codex app-server provider cannot complete a call."""
+
+
+class _CodexAppServerNoFinalResponse(CodexAppServerError):
+    """Raised when a completed app-server turn contains no assistant response."""
 
 
 @dataclass
@@ -251,6 +256,13 @@ class _JsonRpcProcess:
             payload["params"] = params
         self._write(payload)
 
+    def respond(self, request_id: int | str, result: dict[str, Any]) -> None:
+        """Answer a server-initiated JSON-RPC request on the same connection."""
+        self._write({"id": request_id, "result": result})
+
+    def reset_deadline(self) -> None:
+        self.deadline = monotonic() + self.timeout_seconds
+
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         request_id = self._next_id
         self._next_id += 1
@@ -360,8 +372,31 @@ class _JsonRpcProcess:
                     pass
 
 
+@dataclass
+class _ActiveCodexTurn:
+    rpc: _JsonRpcProcess
+    temp_context: Any
+    tool_specs: list[dict[str, Any]]
+    usage: dict[str, int]
+    prompt_fingerprints: tuple[str, ...]
+    final_text: str | None = None
+    pending_request_id: int | str | None = None
+    pending_call_id: str | None = None
+    pending_tool_name: str | None = None
+    expiration_timer: Timer | None = None
+    expiration_generation: int = 0
+    closed: bool = False
+
+
 class CodexAppServerClient:
-    """One-shot ChatGPT OAuth client backed by the official Codex app-server."""
+    """ChatGPT OAuth client backed by the official Codex app-server.
+
+    COVAS executes actions outside the model adapter. When app-server pauses a
+    turn for a dynamic tool, keep that process alive until the matching COVAS
+    tool result arrives on the next ``generate`` call. This preserves the same
+    model turn (and its reasoning state) instead of reconstructing it unless the
+    pending process has already expired.
+    """
 
     def __init__(
         self,
@@ -370,6 +405,8 @@ class CodexAppServerClient:
     ):
         self.command = command
         self.timeout_seconds = timeout_seconds
+        self._lock = RLock()
+        self._pending_turn: _ActiveCodexTurn | None = None
 
     def generate(
         self,
@@ -381,7 +418,62 @@ class CodexAppServerClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
     ) -> CodexAppServerResult:
+        with self._lock:
+            active = self._resume_pending_turn(messages)
+            if active is not None:
+                try:
+                    try:
+                        result = self._wait_for_turn(active, retain_tool_turn=True)
+                    except _CodexAppServerNoFinalResponse:
+                        result = CodexAppServerResult(text=None, tool_calls=[], usage={})
+                finally:
+                    if self._pending_turn is not active:
+                        self._close_turn(active)
+
+                if result.text is not None or result.tool_calls:
+                    return result
+
+                # A completed resumed turn can very rarely contain an empty
+                # final agent message. Replay the already supplied COVAS call
+                # and tool result once on a fresh ephemeral thread; never loop.
+                return self._generate_new(
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    text_verbosity=text_verbosity,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    retain_tool_turn=self._pending_turn is None,
+                )
+
+            # Action-cache verification can issue an unrelated model call after
+            # COVAS executes the requested action but before its ToolEvent is
+            # rendered into the next prompt. Keep the real turn pending and make
+            # that unrelated call one-shot so it cannot displace the continuation.
+            return self._generate_new(
+                model=model,
+                reasoning_effort=reasoning_effort,
+                text_verbosity=text_verbosity,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                retain_tool_turn=self._pending_turn is None,
+            )
+
+    def _generate_new(
+        self,
+        *,
+        model: str,
+        reasoning_effort: str | None,
+        text_verbosity: str | None,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        retain_tool_turn: bool,
+    ) -> CodexAppServerResult:
         rpc = _JsonRpcProcess(self.command, self.timeout_seconds)
+        temp_context: Any = None
+        active: _ActiveCodexTurn | None = None
         try:
             rpc.request(
                 "initialize",
@@ -438,148 +530,370 @@ class CodexAppServerClient:
 
             temp_context = tempfile.TemporaryDirectory(prefix="covas-codex-")
             temp_cwd = temp_context.name
-            try:
-                thread_params: dict[str, Any] = {
-                    "model": model,
-                    "cwd": str(Path(temp_cwd).resolve()),
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only",
-                    "config": config,
-                    "serviceName": "covas-next",
-                    "baseInstructions": system_instructions,
-                    "developerInstructions": developer_instructions,
-                    "ephemeral": True,
-                }
-                if tool_specs:
-                    thread_params["dynamicTools"] = [
-                        {
-                            "type": "function",
-                            "name": spec["name"],
-                            "description": spec["description"],
-                            "inputSchema": spec["parameters"],
-                        }
-                        for spec in tool_specs
-                    ]
-                start_result = rpc.request("thread/start", thread_params)
-                thread = start_result.get("thread")
-                thread_id = thread.get("id") if isinstance(thread, dict) else None
-                if not isinstance(thread_id, str) or not thread_id:
-                    raise CodexAppServerError("Codex app-server did not return a thread id.")
+            thread_params: dict[str, Any] = {
+                "model": model,
+                "cwd": str(Path(temp_cwd).resolve()),
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "config": config,
+                "serviceName": "covas-next",
+                "baseInstructions": system_instructions,
+                "developerInstructions": developer_instructions,
+                "ephemeral": True,
+            }
+            if tool_specs:
+                thread_params["dynamicTools"] = [
+                    {
+                        "type": "function",
+                        "name": spec["name"],
+                        "description": spec["description"],
+                        "inputSchema": spec["parameters"],
+                    }
+                    for spec in tool_specs
+                ]
+            start_result = rpc.request("thread/start", thread_params)
+            thread = start_result.get("thread")
+            thread_id = thread.get("id") if isinstance(thread, dict) else None
+            if not isinstance(thread_id, str) or not thread_id:
+                raise CodexAppServerError("Codex app-server did not return a thread id.")
 
-                if history:
-                    rpc.request("thread/inject_items", {"threadId": thread_id, "items": history})
+            if history:
+                rpc.request("thread/inject_items", {"threadId": thread_id, "items": history})
 
-                turn_params: dict[str, Any] = {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": turn_text}],
-                    "model": model,
-                }
-                if reasoning_effort and reasoning_effort != "default":
-                    turn_params["effort"] = reasoning_effort
-                rpc.request("turn/start", turn_params)
+            turn_params: dict[str, Any] = {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": turn_text}],
+                "model": model,
+            }
+            if reasoning_effort and reasoning_effort != "default":
+                turn_params["effort"] = reasoning_effort
+            rpc.request("turn/start", turn_params)
 
-                final_text: str | None = None
-                usage: dict[str, int] = {}
-
-                def record_usage(notification_params: dict[str, Any]) -> None:
-                    nonlocal usage
-                    token_usage = notification_params.get("tokenUsage")
-                    last = token_usage.get("last") if isinstance(token_usage, dict) else None
-                    if isinstance(last, dict):
-                        usage = {
-                            "input_tokens": int(last.get("inputTokens") or 0),
-                            "cached_tokens": int(last.get("cachedInputTokens") or 0),
-                            "output_tokens": int(last.get("outputTokens") or 0),
-                            "reasoning_tokens": int(last.get("reasoningOutputTokens") or 0),
-                            "total_tokens": int(last.get("totalTokens") or 0),
-                        }
-
-                while True:
-                    notification = rpc.wait_for(
-                        lambda item: item.get("method")
-                        in {
-                            "item/completed",
-                            "thread/tokenUsage/updated",
-                            "turn/completed",
-                            "error",
-                            "item/tool/call",
-                        }
-                    )
-                    method = notification.get("method")
-                    params = notification.get("params")
-                    params = params if isinstance(params, dict) else {}
-                    if method == "item/completed":
-                        item = params.get("item")
-                        if isinstance(item, dict) and item.get("type") == "agentMessage":
-                            phase = item.get("phase")
-                            if phase in {None, "final_answer"}:
-                                final_text = str(item.get("text") or "")
-                    elif method == "item/tool/call":
-                        tool_name = params.get("tool")
-                        arguments = params.get("arguments")
-                        call_id = params.get("callId")
-                        allowed_tools = {spec["name"] for spec in tool_specs}
-                        if not isinstance(tool_name, str) or tool_name not in allowed_tools:
-                            raise CodexAppServerError(
-                                f"Codex app-server requested unknown action: {tool_name!r}."
-                            )
-                        if not isinstance(arguments, dict):
-                            raise CodexAppServerError(
-                                f"Arguments for action {tool_name!r} must be a JSON object."
-                            )
-                        if not isinstance(call_id, str) or not call_id:
-                            raise CodexAppServerError(
-                                f"Codex app-server omitted the call id for action {tool_name!r}."
-                            )
-                        # The turn pauses on the dynamic tool request, but its
-                        # token-usage notification is often written immediately
-                        # afterwards. Drain it briefly so action-heavy sessions
-                        # are not systematically recorded as zero tokens.
-                        usage_notification = rpc.wait_for_optional(
-                            lambda item: item.get("method") == "thread/tokenUsage/updated",
-                            0.2,
-                        )
-                        if usage_notification is not None:
-                            usage_params = usage_notification.get("params")
-                            record_usage(usage_params if isinstance(usage_params, dict) else {})
-                        # COVAS executes the action outside app-server. The next
-                        # generate call replays this call and its result from normal
-                        # COVAS history into a fresh ephemeral thread.
-                        return CodexAppServerResult(
-                            text=None,
-                            tool_calls=[
-                                {
-                                    "id": call_id,
-                                    "name": tool_name,
-                                    "arguments": json.dumps(arguments, ensure_ascii=False),
-                                }
-                            ],
-                            usage=usage,
-                        )
-                    elif method == "thread/tokenUsage/updated":
-                        record_usage(params)
-                    elif method == "error":
-                        raise CodexAppServerError(
-                            str(params.get("message") or "Codex app-server reported an error.")
-                        )
-                    elif method == "turn/completed":
-                        turn = params.get("turn")
-                        if isinstance(turn, dict) and turn.get("status") == "failed":
-                            error = turn.get("error")
-                            detail = error.get("message") if isinstance(error, dict) else error
-                            raise CodexAppServerError(f"Codex app-server turn failed: {detail}")
-                        break
-
-                if final_text is None:
-                    raise CodexAppServerError("Codex app-server completed without a final response.")
-                return CodexAppServerResult(text=final_text or None, tool_calls=[], usage=usage)
-            finally:
-                # On Windows app-server keeps its cwd open until the child exits.
-                # Stop it before TemporaryDirectory attempts to remove that cwd.
-                rpc.close()
-                temp_context.cleanup()
+            active = _ActiveCodexTurn(
+                rpc=rpc,
+                temp_context=temp_context,
+                tool_specs=tool_specs,
+                usage={},
+                prompt_fingerprints=self._message_fingerprints(messages),
+            )
+            return self._wait_for_turn(active, retain_tool_turn=retain_tool_turn)
         finally:
-            rpc.close()
+            if active is None:
+                rpc.close()
+                if temp_context is not None:
+                    temp_context.cleanup()
+            elif self._pending_turn is not active:
+                self._close_turn(active)
+
+    def _wait_for_turn(
+        self,
+        active: _ActiveCodexTurn,
+        *,
+        retain_tool_turn: bool,
+    ) -> CodexAppServerResult:
+        rpc = active.rpc
+        while True:
+            notification = rpc.wait_for(
+                lambda item: item.get("method")
+                in {
+                    "item/completed",
+                    "thread/tokenUsage/updated",
+                    "turn/completed",
+                    "error",
+                    "item/tool/call",
+                }
+            )
+            method = notification.get("method")
+            params = notification.get("params")
+            params = params if isinstance(params, dict) else {}
+            if method == "item/completed":
+                item = params.get("item")
+                if isinstance(item, dict) and item.get("type") == "agentMessage":
+                    phase = item.get("phase")
+                    if phase in {None, "final_answer"}:
+                        active.final_text = str(item.get("text") or "")
+            elif method == "item/tool/call":
+                tool_name = params.get("tool")
+                arguments = params.get("arguments")
+                call_id = params.get("callId")
+                request_id = notification.get("id")
+                allowed_tools = {spec["name"] for spec in active.tool_specs}
+                if not isinstance(tool_name, str) or tool_name not in allowed_tools:
+                    raise CodexAppServerError(
+                        f"Codex app-server requested unknown action: {tool_name!r}."
+                    )
+                if not isinstance(arguments, dict):
+                    raise CodexAppServerError(
+                        f"Arguments for action {tool_name!r} must be a JSON object."
+                    )
+                if not isinstance(call_id, str) or not call_id:
+                    raise CodexAppServerError(
+                        f"Codex app-server omitted the call id for action {tool_name!r}."
+                    )
+                if isinstance(request_id, bool) or not isinstance(request_id, (int, str)):
+                    raise CodexAppServerError(
+                        f"Codex app-server omitted the request id for action {tool_name!r}."
+                    )
+                # The turn pauses on the dynamic tool request, but its token
+                # usage notification is often written immediately afterwards.
+                usage_notification = rpc.wait_for_optional(
+                    lambda item: item.get("method") == "thread/tokenUsage/updated",
+                    0.2,
+                )
+                if usage_notification is not None:
+                    usage_params = usage_notification.get("params")
+                    self._record_usage(
+                        active,
+                        usage_params if isinstance(usage_params, dict) else {},
+                    )
+                if retain_tool_turn:
+                    active.pending_request_id = request_id
+                    active.pending_call_id = call_id
+                    active.pending_tool_name = tool_name
+                    self._pending_turn = active
+                    self._arm_pending_expiration(active)
+                return CodexAppServerResult(
+                    text=None,
+                    tool_calls=[
+                        {
+                            "id": call_id,
+                            "name": tool_name,
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        }
+                    ],
+                    usage=dict(active.usage),
+                )
+            elif method == "thread/tokenUsage/updated":
+                self._record_usage(active, params)
+            elif method == "error":
+                raise CodexAppServerError(
+                    str(params.get("message") or "Codex app-server reported an error.")
+                )
+            elif method == "turn/completed":
+                turn = params.get("turn")
+                if isinstance(turn, dict) and turn.get("status") == "failed":
+                    error = turn.get("error")
+                    detail = error.get("message") if isinstance(error, dict) else error
+                    raise CodexAppServerError(f"Codex app-server turn failed: {detail}")
+                break
+
+        if active.final_text is None:
+            raise _CodexAppServerNoFinalResponse(
+                "Codex app-server completed without a final response."
+            )
+        return CodexAppServerResult(
+            text=active.final_text or None,
+            tool_calls=[],
+            usage=dict(active.usage),
+        )
+
+    @staticmethod
+    def _record_usage(active: _ActiveCodexTurn, notification_params: dict[str, Any]) -> None:
+        token_usage = notification_params.get("tokenUsage")
+        last = token_usage.get("last") if isinstance(token_usage, dict) else None
+        if isinstance(last, dict):
+            active.usage = {
+                "input_tokens": int(last.get("inputTokens") or 0),
+                "cached_tokens": int(last.get("cachedInputTokens") or 0),
+                "output_tokens": int(last.get("outputTokens") or 0),
+                "reasoning_tokens": int(last.get("reasoningOutputTokens") or 0),
+                "total_tokens": int(last.get("totalTokens") or 0),
+            }
+
+    def _resume_pending_turn(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> _ActiveCodexTurn | None:
+        active = self._pending_turn
+        if active is None or active.pending_call_id is None:
+            return None
+
+        found, output, prompt_unchanged = self._find_unmodified_tool_result(
+            messages,
+            active,
+        )
+        if not prompt_unchanged:
+            # A new commander utterance, game event, or changed live-status
+            # message must be visible to the model. Abandon the paused turn so
+            # generate() replays the complete current COVAS prompt instead of
+            # resuming reasoning that predates that information.
+            self._pending_turn = None
+            self._close_turn(active)
+            return None
+        if not found:
+            return None
+
+        self._pending_turn = None
+        if active.expiration_timer is not None:
+            active.expiration_timer.cancel()
+            active.expiration_timer = None
+
+        request_id = active.pending_request_id
+        if request_id is None:
+            self._close_turn(active)
+            return None
+
+        active.rpc.reset_deadline()
+        try:
+            active.rpc.respond(
+                request_id,
+                {
+                    "contentItems": [{"type": "inputText", "text": output}],
+                    "success": not output.lstrip().upper().startswith("ERROR:"),
+                },
+            )
+        except CodexAppServerError:
+            # The normal COVAS prompt still contains the call and result, so a
+            # fresh ephemeral thread remains a safe compatibility fallback.
+            self._close_turn(active)
+            return None
+
+        active.pending_request_id = None
+        active.pending_call_id = None
+        active.pending_tool_name = None
+        # A resumed turn may request another dynamic tool. Its continuation
+        # baseline includes the call/result that was just accepted here.
+        active.prompt_fingerprints = self._message_fingerprints(messages)
+        return active
+
+    @staticmethod
+    def _message_fingerprints(messages: list[dict[str, Any]]) -> tuple[str, ...]:
+        return tuple(
+            json.dumps(
+                _model_dump_compatible(raw_message),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            for raw_message in messages
+        )
+
+    @classmethod
+    def _find_unmodified_tool_result(
+        cls,
+        messages: list[dict[str, Any]],
+        active: _ActiveCodexTurn,
+    ) -> tuple[bool, str, bool]:
+        call_id = active.pending_call_id
+        if call_id is None:
+            return False, "", False
+
+        result_indices: list[int] = []
+        assistant_indices: list[int] = []
+        output = ""
+        for index, raw_message in enumerate(messages):
+            message = _model_dump_compatible(raw_message)
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "tool":
+                message_call_id = message.get("tool_call_id") or message.get("call_id")
+                if str(message_call_id or "") == call_id:
+                    result_indices.append(index)
+                    output = _stringify_content(message.get("content"))
+            elif cls._is_expected_assistant_tool_call(
+                message,
+                call_id,
+                active.pending_tool_name,
+            ):
+                assistant_indices.append(index)
+
+        # One tool result is the only required addition. COVAS also normally
+        # records the corresponding assistant tool-call envelope; app-server
+        # already owns that call, so the envelope is optional but may occur once.
+        if len(result_indices) > 1 or len(assistant_indices) > 1:
+            return bool(result_indices), output, False
+
+        expected_indices = set(result_indices + assistant_indices)
+        remaining_messages = [
+            raw_message
+            for index, raw_message in enumerate(messages)
+            if index not in expected_indices
+        ]
+        prompt_unchanged = (
+            cls._message_fingerprints(remaining_messages) == active.prompt_fingerprints
+        )
+        return len(result_indices) == 1, output, prompt_unchanged
+
+    @staticmethod
+    def _is_expected_assistant_tool_call(
+        message: dict[str, Any],
+        call_id: str,
+        tool_name: str | None,
+    ) -> bool:
+        if message.get("role") != "assistant":
+            return False
+        if _stringify_content(message.get("content")).strip():
+            return False
+        raw_calls = message.get("tool_calls") or []
+        if not isinstance(raw_calls, list) or len(raw_calls) != 1:
+            return False
+        call = _model_dump_compatible(raw_calls[0])
+        if not isinstance(call, dict):
+            return False
+        message_call_id = call.get("id") or call.get("call_id")
+        if str(message_call_id or "") != call_id:
+            return False
+        function = _model_dump_compatible(call.get("function"))
+        if not isinstance(function, dict):
+            return False
+        return tool_name is None or str(function.get("name") or "") == tool_name
+
+    def _arm_pending_expiration(self, active: _ActiveCodexTurn) -> None:
+        if active.expiration_timer is not None:
+            active.expiration_timer.cancel()
+        active.expiration_generation += 1
+        expiration_generation = active.expiration_generation
+        active.rpc.reset_deadline()
+        client_ref = weakref.ref(self)
+
+        def expire() -> None:
+            client = client_ref()
+            if client is not None:
+                client._expire_pending(active, expiration_generation)
+
+        timer = Timer(max(float(self.timeout_seconds), 1.0), expire)
+        timer.daemon = True
+        active.expiration_timer = timer
+        timer.start()
+
+    def _expire_pending(
+        self,
+        active: _ActiveCodexTurn,
+        expiration_generation: int,
+    ) -> None:
+        with self._lock:
+            if (
+                self._pending_turn is active
+                and active.expiration_generation == expiration_generation
+            ):
+                self._pending_turn = None
+                self._close_turn(active)
+
+    @staticmethod
+    def _close_turn(active: _ActiveCodexTurn) -> None:
+        if active.closed:
+            return
+        active.closed = True
+        if active.expiration_timer is not None:
+            active.expiration_timer.cancel()
+            active.expiration_timer = None
+        # On Windows app-server keeps its cwd open until the child exits.
+        active.rpc.close()
+        active.temp_context.cleanup()
+
+    def close(self) -> None:
+        with self._lock:
+            active = self._pending_turn
+            self._pending_turn = None
+            if active is not None:
+                self._close_turn(active)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _prepare_messages(
         self, messages: list[dict[str, Any]]

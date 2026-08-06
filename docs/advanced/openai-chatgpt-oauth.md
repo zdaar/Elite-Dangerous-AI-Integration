@@ -37,10 +37,24 @@ Scoop NVM and `%APPDATA%\npm` locations. An explicit native `codex.cmd` path
 can also be entered.
 
 The ChatGPT OAuth provider starts an ephemeral, read-only app-server thread for
-each COVAS model call. Shell, filesystem, web, app, MCP, skill, and multi-agent
-host tools are disabled. Only COVAS actions are exposed through app-server
-`dynamicTools`; COVAS executes the selected action and replays its result in
-the next model call.
+each independent COVAS request. Shell, filesystem, web, app, MCP, skill, and
+multi-agent host tools are disabled. Only COVAS actions are exposed through
+app-server `dynamicTools`. When the model selects one, COVAS executes it and
+returns the result to the same app-server turn so the model retains its current
+reasoning context. If that continuation exceptionally returns no assistant
+text, COVAS performs one bounded replay from the recorded call and result.
+
+The legacy COVAS action cache is bypassed for this provider. Terra therefore
+does not make a second verification request after every new tool call; the
+deterministic routing guard and the live tool result remain authoritative.
+
+To verify the complete OAuth path after updating Codex CLI, run the opt-in live
+smoke test from a Windows Python environment:
+
+```powershell
+$env:COVAS_LIVE_CODEX_TEST = '1'
+python -m pytest test/lib/test_CodexAppServer.py -k replays_tool_result_to_final_text -v
+```
 
 ## Boundaries
 
@@ -54,6 +68,9 @@ the next model call.
   inside COVAS.
 - ChatGPT subscription limits and model availability still apply to the logged
   in account.
+- Codex app-server dynamic tools are experimental. This integration is tested
+  against Codex CLI 0.146.1; rerun the live tool-loop smoke test after a Codex
+  CLI upgrade.
 
 Official references:
 

@@ -5,7 +5,12 @@ import sys
 
 import pytest
 
-from src.lib.CodexAppServer import CodexAppServerClient, _app_server_argv
+from src.lib.CodexAppServer import (
+    CodexAppServerClient,
+    CodexAppServerResult,
+    _CodexAppServerNoFinalResponse,
+    _app_server_argv,
+)
 
 
 FAKE_APP_SERVER = r'''
@@ -95,6 +100,44 @@ for raw_line in sys.stdin:
                 "method": "turn/completed",
                 "params": {"threadId": "thread-test", "turn": {"id": "turn-test", "status": "completed", "items": []}},
             })
+    elif request_id == 900 and method is None:
+        result = message["result"]
+        assert result["success"] is True
+        assert result["contentItems"][0]["type"] == "inputText"
+        tool_output = result["contentItems"][0]["text"]
+        send({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-test",
+                "turnId": "turn-test",
+                "item": {
+                    "type": "dynamicToolCall",
+                    "id": "tool-1",
+                    "tool": dynamic_tools[0]["name"],
+                    "status": "completed",
+                    "contentItems": result["contentItems"],
+                    "success": True,
+                },
+            },
+        })
+        send({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-test",
+                "turnId": "turn-test",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "msg-after-tool",
+                    "text": "Tool result received: " + tool_output,
+                    "phase": "final_answer",
+                    "memoryCitation": None,
+                },
+            },
+        })
+        send({
+            "method": "turn/completed",
+            "params": {"threadId": "thread-test", "turn": {"id": "turn-test", "status": "completed", "items": []}},
+        })
 '''
 
 
@@ -234,6 +277,255 @@ def test_app_server_replays_covas_tool_history_as_response_items() -> None:
     assert turn_text.startswith("Continue the COVAS conversation")
 
 
+def _live_probe_tools() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "probe_action",
+                "description": "A harmless integration-test action.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
+def test_app_server_continues_same_turn_with_covas_tool_result(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    first = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=[{"role": "user", "content": "Run the probe."}],
+        tools=_live_probe_tools(),
+    )
+    assert len(first.tool_calls) == 1
+    tool_call = first.tool_calls[0]
+
+    final = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=[
+            {"role": "user", "content": "Run the probe."},
+            {
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": "route-ready",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": tool_call["arguments"],
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=_live_probe_tools(),
+    )
+
+    assert final.tool_calls == []
+    assert final.text == "Tool result received: route-ready"
+    assert client._pending_turn is None
+
+
+@pytest.mark.parametrize(
+    "initial_messages,continuation_addition",
+    [
+        (
+            [{"role": "user", "content": "Run the probe."}],
+            {"role": "user", "content": "Cancel that; show live status instead."},
+        ),
+        (
+            [
+                {"role": "user", "content": "Run the probe."},
+                {"role": "user", "content": "[Game status] Fuel: 12.0"},
+            ],
+            {"role": "user", "content": "[Game status] Fuel: 11.5"},
+        ),
+    ],
+    ids=["new-commander-message", "changed-game-status"],
+)
+def test_new_prompt_information_closes_pending_turn_and_replays_full_prompt(
+    tmp_path: Path,
+    initial_messages: list[dict],
+    continuation_addition: dict,
+) -> None:
+    client = _client(tmp_path)
+    first = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=initial_messages,
+        tools=_live_probe_tools(),
+    )
+    assert len(first.tool_calls) == 1
+    tool_call = first.tool_calls[0]
+    original_turn = client._pending_turn
+    assert original_turn is not None
+
+    if continuation_addition["content"].startswith("[Game status]"):
+        continuation_messages = [
+            initial_messages[0],
+            continuation_addition,
+        ]
+    else:
+        continuation_messages = [*initial_messages, continuation_addition]
+    continuation_messages.extend(
+        [
+            {
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "content": "route-ready",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": tool_call["arguments"],
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+
+    replay = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=continuation_messages,
+        tools=_live_probe_tools(),
+    )
+
+    try:
+        # A same-turn resume would have returned "Tool result received". A new
+        # tool call proves the complete changed prompt went to a fresh process.
+        assert replay.text is None
+        assert len(replay.tool_calls) == 1
+        assert original_turn.closed is True
+        assert original_turn.rpc.process.poll() is not None
+        assert client._pending_turn is not None
+        assert client._pending_turn is not original_turn
+    finally:
+        client.close()
+
+
+def test_client_close_terminates_a_pending_dynamic_turn(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    result = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=[{"role": "user", "content": "Run the probe."}],
+        tools=_live_probe_tools(),
+    )
+    assert result.tool_calls
+    active = client._pending_turn
+    assert active is not None
+    assert active.rpc.process.poll() is None
+
+    client.close()
+
+    assert client._pending_turn is None
+    assert active.closed is True
+    assert active.rpc.process.poll() is not None
+
+
+def test_stale_expiration_cannot_close_rearmed_pending_turn(tmp_path: Path) -> None:
+    client = _client(tmp_path)
+    result = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=[{"role": "user", "content": "Run the probe."}],
+        tools=_live_probe_tools(),
+    )
+    assert result.tool_calls
+    active = client._pending_turn
+    assert active is not None
+    stale_generation = active.expiration_generation
+
+    # Re-arming models a second dynamic tool on the same app-server turn.
+    client._arm_pending_expiration(active)
+    current_generation = active.expiration_generation
+    assert current_generation == stale_generation + 1
+
+    client._expire_pending(active, stale_generation)
+
+    assert client._pending_turn is active
+    assert active.closed is False
+    assert active.rpc.process.poll() is None
+
+    client._expire_pending(active, current_generation)
+
+    assert client._pending_turn is None
+    assert active.closed is True
+    assert active.rpc.process.poll() is not None
+
+
+@pytest.mark.parametrize("empty_mode", ["empty_message", "missing_message"])
+def test_empty_same_turn_final_gets_one_fresh_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    empty_mode: str,
+) -> None:
+    client = CodexAppServerClient("codex")
+    active = object()
+    replayed = CodexAppServerResult(text="Recovered.", tool_calls=[], usage={})
+    replay_calls: list[dict] = []
+    lifecycle: list[str] = []
+
+    monkeypatch.setattr(client, "_resume_pending_turn", lambda messages: active)
+    def wait_for_resumed_turn(current, retain_tool_turn):
+        if empty_mode == "missing_message":
+            raise _CodexAppServerNoFinalResponse("no final response")
+        return CodexAppServerResult(
+            text=None,
+            tool_calls=[],
+            usage={"total_tokens": 7},
+        )
+
+    monkeypatch.setattr(client, "_wait_for_turn", wait_for_resumed_turn)
+    monkeypatch.setattr(client, "_close_turn", lambda current: lifecycle.append("closed"))
+
+    def replay_once(**kwargs):
+        lifecycle.append("replayed")
+        replay_calls.append(kwargs)
+        return replayed
+
+    monkeypatch.setattr(client, "_generate_new", replay_once)
+    messages = [{"role": "tool", "tool_call_id": "call-1", "content": "ready"}]
+
+    result = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=messages,
+        tools=_live_probe_tools(),
+    )
+
+    assert result is replayed
+    assert len(replay_calls) == 1
+    assert replay_calls[0]["messages"] is messages
+    assert replay_calls[0]["retain_tool_turn"] is True
+    assert lifecycle == ["closed", "replayed"]
+
+
 @pytest.mark.skipif(
     os.environ.get("COVAS_LIVE_CODEX_TEST") != "1",
     reason="requires an explicit live ChatGPT/Codex smoke-test opt in",
@@ -253,24 +545,82 @@ def test_live_codex_app_server_dynamic_tool_bridge() -> None:
                 "content": "Call probe_action with value set to ok. Do not reply with text.",
             },
         ],
-        tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "probe_action",
-                    "description": "A harmless integration-test action.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"value": {"type": "string"}},
-                        "required": ["value"],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        ],
+        tools=_live_probe_tools(),
     )
 
     assert result.text is None
     assert result.tool_calls
     assert result.tool_calls[0]["name"] == "probe_action"
     assert json.loads(result.tool_calls[0]["arguments"])["value"] == "ok"
+
+
+@pytest.mark.skipif(
+    os.environ.get("COVAS_LIVE_CODEX_TEST") != "1",
+    reason="requires an explicit live ChatGPT/Codex smoke-test opt in",
+)
+def test_live_codex_app_server_replays_tool_result_to_final_text() -> None:
+    client = CodexAppServerClient(
+        os.environ.get("COVAS_CODEX_COMMAND", "codex"),
+        timeout_seconds=120,
+    )
+    system_prompt = (
+        "This is a deterministic integration test. If no probe_action result is "
+        "present in the conversation, call probe_action exactly once with value ok "
+        "and emit no text. If its result is present, call no tool and reply with "
+        "exactly that result text."
+    )
+    user_prompt = "Run probe_action once, then report its returned result."
+
+    first = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        tools=_live_probe_tools(),
+    )
+
+    assert first.text is None
+    assert len(first.tool_calls) == 1
+    tool_call = first.tool_calls[0]
+    assert tool_call["name"] == "probe_action"
+    assert json.loads(tool_call["arguments"])["value"] == "ok"
+
+    tool_result = "COVAS_RESULT_route-ready-7319"
+    final = client.generate(
+        model="gpt-5.6-terra",
+        reasoning_effort="low",
+        text_verbosity="low",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+            # PromptGenerator's legacy COVAS history can put the result before
+            # its assistant call. _prepare_messages must repair that ordering.
+            {
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "name": tool_call["name"],
+                "content": tool_result,
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": tool_call["arguments"],
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=_live_probe_tools(),
+    )
+
+    assert final.tool_calls == []
+    assert tool_result in (final.text or "")

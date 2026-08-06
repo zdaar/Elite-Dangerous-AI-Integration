@@ -34,9 +34,9 @@ OpenAI sometimes needs a few minutes to process your payment. If you are still h
 
 We have a native Linux version available, but it requires some special setup. Please contact us on discord and we will help you get it running.
 
-## Can I use Deepseek or other reasoning models?
+## Can I use reasoning models?
 
-While technically possible, reasoning models have a response time of many seconds to minutes, which is not suitable for real-time interaction. The advantage of these models in coding and mathematics is not useful in the context of creative writing and storytelling and due to the long reasoning chains, these models are far more expensive than our recommended configuration.
+Yes. COVAS supports reasoning effort for compatible providers, including the OpenAI Responses API and ChatGPT OAuth through the official Codex app-server. For responsive, tool-heavy play, start with low reasoning effort and low text verbosity; increase the effort only when a task needs deeper planning. See [OpenAI reasoning models and ChatGPT OAuth](advanced/openai-chatgpt-oauth.md) for setup and provider boundaries.
 
 ## I have encounter a bug or an issue, what should I do?
 
