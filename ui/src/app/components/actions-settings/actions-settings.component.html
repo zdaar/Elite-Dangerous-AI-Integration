@@ -344,6 +344,17 @@
         <p>The action cache allows the AI to learn from previous interactions and reuse actions for similar
             inputs, making responses faster and more consistent.</p>
         <h2>Quality of Life</h2>
+        <mat-slide-toggle [ngModel]="config.qol_non_kgbfoam_jump_warning"
+                          (ngModelChange)="onConfigChange({qol_non_kgbfoam_jump_warning: $event})">
+            Warn before non-KGBFOAM jumps
+        </mat-slide-toggle>
+        <p>Calmly identifies the immediate destination star when hyperspace charging begins. Classification and wording are local and deterministic.</p>
+        <mat-slide-toggle [ngModel]="config.qol_non_kgbfoam_unknown_warning"
+                          (ngModelChange)="onConfigChange({qol_non_kgbfoam_unknown_warning: $event})"
+                          [disabled]="!config.qol_non_kgbfoam_jump_warning">
+            Warn when the next star class is unknown
+        </mat-slide-toggle>
+        <p>Optional. Nova will say that the class is unknown without guessing it.</p>
         <mat-slide-toggle [ngModel]="config.qol_autobrake"
                             (ngModelChange)="onConfigChange({qol_autobrake: $event})">
             Auto Brake

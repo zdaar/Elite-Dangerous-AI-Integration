@@ -89,6 +89,12 @@ from lib.QuestCatalogManager import QuestCatalogManager
 from lib.SystemDatabase import SystemDatabase
 from lib.Database import ModelUsageStore, QuestDatabase, VectorStore
 from lib.Assistant import Assistant
+from lib.NonKgbfoamJumpWarning import (
+    NonKgbfoamJumpWarningController,
+    configured_warning_language,
+    format_star_warning,
+    format_unknown_class_warning,
+)
 
 
 def get_model_usage_history_payload(
@@ -406,6 +412,7 @@ class Chat:
         log("debug", "Plugin helper is ready...")
 
         self.previous_states = {}
+        self.non_kgbfoam_jump_warning = NonKgbfoamJumpWarningController()
 
     def emit_runtime_state(self):
         _, projected_states = self.event_manager.get_current_state()
@@ -414,7 +421,53 @@ class Chat:
         emit_message("states", states=projected_states)
         self.previous_states = copy.deepcopy(projected_states)
 
+    def _handle_non_kgbfoam_jump_warning(
+        self,
+        event: Event,
+        projected_states: dict[str, Any],
+    ) -> None:
+        decision = self.non_kgbfoam_jump_warning.process(
+            event,
+            warning_enabled=bool(
+                self.config.get("qol_non_kgbfoam_jump_warning", True)
+            ),
+            unknown_warning_enabled=bool(
+                self.config.get("qol_non_kgbfoam_unknown_warning", False)
+            ),
+        )
+        if decision is None:
+            return
+
+        language = configured_warning_language(cast(dict[str, object], self.config))
+        warning_text = (
+            format_star_warning(decision.profile, language)
+            if decision.profile is not None
+            else format_unknown_class_warning(language)
+        )
+
+        # This uses the normal voice queue and current environmental effects,
+        # but deliberately bypasses the assistant reply/LLM path.
+        show_chat_message("covas", warning_text)
+
+        def on_start() -> None:
+            self.event_manager.add_assistant_speaking()
+
+        def on_complete() -> None:
+            if not self.tts.has_queued_items():
+                self.event_manager.add_assistant_complete_event()
+
+        self.tts.say(
+            warning_text,
+            context="navigation_warning",
+            postprocessing_layers=self.assistant._get_tts_postprocessing_layers(
+                cast(Any, projected_states)
+            ),
+            on_start=on_start,
+            on_complete=on_complete,
+        )
+
     def on_event(self, event: Event, projected_states: dict[str, Any]):
+        self._handle_non_kgbfoam_jump_warning(event, projected_states)
         for key, value in projected_states.items():
             if self.previous_states.get(key, None) != value:
                 send_message(

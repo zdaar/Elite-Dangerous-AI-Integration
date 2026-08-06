@@ -54,3 +54,41 @@ def test_stop_failure_and_manual_tabs_return_ui_to_interactive_state() -> None:
     assert 'this.runModeSubject.next("error")' in tauri[stop_start:stop_end]
     assert "this.isLoading = false" in main_view
     assert '[(selectedIndex)]="selectedTabIndex"' in template
+
+
+def test_non_kgbfoam_warning_settings_use_normal_persistent_config_path() -> None:
+    config_service = _source("ui/src/app/services/config.service.ts")
+    actions_template = _source(
+        "ui/src/app/components/actions-settings/actions-settings.component.html"
+    )
+    actions_component = _source(
+        "ui/src/app/components/actions-settings/actions-settings.component.ts"
+    )
+
+    for setting in (
+        "qol_non_kgbfoam_jump_warning",
+        "qol_non_kgbfoam_unknown_warning",
+    ):
+        assert f"{setting}: boolean" in config_service
+        assert f'onConfigChange({{{setting}: $event}})' in actions_template
+    assert "await this.configService.changeConfig(partialConfig)" in actions_component
+    assert '[disabled]="!config.qol_non_kgbfoam_jump_warning"' in actions_template
+
+
+def test_non_kgbfoam_warning_uses_tts_without_llm_or_navigation_actions() -> None:
+    chat = _source("src/Chat.py")
+    handler_start = chat.index("def _handle_non_kgbfoam_jump_warning")
+    handler_end = chat.index("\n    def on_event", handler_start)
+    handler = chat[handler_start:handler_end]
+
+    assert "self.tts.say(" in handler
+    assert "_get_tts_postprocessing_layers" in handler
+    for forbidden in (
+        "llmModel",
+        ".generate(",
+        "web_search",
+        "plotToTarget",
+        "target_next_system_in_route",
+        "set_speed",
+    ):
+        assert forbidden not in handler

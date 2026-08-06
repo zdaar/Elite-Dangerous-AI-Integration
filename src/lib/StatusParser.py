@@ -378,7 +378,15 @@ class StatusParser:
                 events.append({"event": "LowFuelWarning"})
 
             if old_status["flags"]["FsdCharging"] == False and new_status["flags"]["FsdCharging"]:
-                events.append({"event": "FsdCharging"})
+                charging_event = {"event": "FsdCharging"}
+                flags2 = new_status.get("flags2")
+                if isinstance(flags2, dict) and "FsdHyperdriveCharging" in flags2:
+                    charging_event["JumpType"] = (
+                        "Hyperspace"
+                        if flags2["FsdHyperdriveCharging"]
+                        else "Supercruise"
+                    )
+                events.append(charging_event)
 
         # Only SRV
         if new_status["flags"]["InSRV"]:

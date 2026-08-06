@@ -967,6 +967,8 @@ class Config(TypedDict):
     linux_edcp: bool
     qol_autobrake: bool  # Quality of life: Auto brake when approaching stations
     qol_autoscan: bool  # Quality of life: Auto scan when entering new systems
+    qol_non_kgbfoam_jump_warning: bool
+    qol_non_kgbfoam_unknown_warning: bool
     prefer_primary_bindings: bool  # Prefer primary keybinds over secondary entries
     
     # Overlay settings
@@ -1367,6 +1369,13 @@ def migrate(data: dict) -> dict:
         data.setdefault('codex_app_server_timeout', 120)
         data['config_version'] = 21
 
+    if data['config_version'] < 22:
+        # This personal fork enables the requested deterministic warning while
+        # keeping unknown/malformed classes silent unless explicitly enabled.
+        data.setdefault('qol_non_kgbfoam_jump_warning', True)
+        data.setdefault('qol_non_kgbfoam_unknown_warning', False)
+        data['config_version'] = 22
+
     return data
 
 
@@ -1469,7 +1478,7 @@ def getDefaultCharacter(config: Config) -> Character:
 
 def load_config() -> Config:
     defaults: Config = {
-        'config_version': 21,
+        'config_version': 22,
         'commander_name': "",
         'characters': [],
         'active_character_index': 0,  # -1 means using the default legacy character
@@ -1550,6 +1559,8 @@ def load_config() -> Config:
         "linux_edcp": False,
         "qol_autobrake": False,  # Quality of life: Auto brake when approaching stations
         "qol_autoscan": False,  # Quality of life: Auto scan when entering new systems
+        "qol_non_kgbfoam_jump_warning": True,
+        "qol_non_kgbfoam_unknown_warning": False,
 
         # Overlay settings - defaults
         "overlay_show_avatar": True,
