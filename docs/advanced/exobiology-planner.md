@@ -100,6 +100,15 @@ For normal operation, return one or two short sentences containing only:
 
 Do not initiate roleplay or commentary from game events. An explicit request for a joke, roleplay, or another tone is a valid commander override and must not be refused because of operational mode.
 
+## Deterministic expedition callouts
+
+An active managed expedition adds two operational callouts without asking the LLM to interpret the journal:
+
+- `FSDJump` or `Location` matching the current system-level queue target announces that the destination was reached and reads the exact `targeted_fss_bodies` checklist in arrival-distance order.
+- `FSSBodySignals` caches the biological signal count for a listed candidate. The following `Scan` event reports that count and the journal's `WasFootfalled` value. A listed body with no biological signal is an immediate skip; a body with biology is sent to BioInsights, with DSS reserved for a Stratum prediction.
+
+Each arrival and candidate result is announced once. Unlisted bodies, transit systems, historic journal replay, and completed queues remain silent. `WasFootfalled` is only a First Footfall marker and is never presented as proof that First Logged is unavailable.
+
 ## Maintenance references
 
 The authoritative local workflow is tracked under `guides/elite`. The packaged app

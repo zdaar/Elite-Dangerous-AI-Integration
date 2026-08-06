@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from lib.PluginBase import PluginBase, PluginManifest
 from lib.PluginHelper import PluginHelper
+from lib.Event import Event, GameEvent
 from lib.RouteSafety import RouteSafetyPolicy, route_safety_policy_from_config
 from lib.actions.ExobiologyPlanner import plan_exobiology
 
@@ -99,6 +100,62 @@ def _systems_match(first: Any, second: Any) -> bool:
         str(first or "").strip()
         and str(first or "").strip().casefold() == str(second or "").strip().casefold()
     )
+
+
+def _body_key(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _short_body_name(system: str, body: str) -> str:
+    prefix = f"{system.strip()} "
+    if body.casefold().startswith(prefix.casefold()):
+        return body[len(prefix):].strip()
+    return body.strip()
+
+
+def _join_spoken(items: list[str], language: str) -> str:
+    if len(items) < 2:
+        return items[0] if items else ""
+    conjunction = " et " if language == "fr" else " and "
+    return f"{', '.join(items[:-1])}{conjunction}{items[-1]}"
+
+
+def _candidate_bodies_in_visit_order(target: dict[str, Any]) -> list[str]:
+    """Return exact candidate names ordered by arrival distance when available."""
+    raw_names = [
+        str(name or "").strip()
+        for name in target.get("targeted_fss_bodies") or []
+        if str(name or "").strip()
+    ]
+    records = {
+        _body_key(record.get("body")): record
+        for record in target.get("candidate_bodies") or []
+        if isinstance(record, dict) and str(record.get("body") or "").strip()
+    }
+
+    def sort_key(item: tuple[int, str]) -> tuple[float, int]:
+        original_index, name = item
+        distance = records.get(_body_key(name), {}).get("distance_to_arrival_ls")
+        if isinstance(distance, (int, float)):
+            return float(distance), original_index
+        return float("inf"), original_index
+
+    return [name for _index, name in sorted(enumerate(raw_names), key=sort_key)]
+
+
+def _biological_signal_count(content: dict[str, Any]) -> int:
+    count = 0
+    for signal in content.get("Signals") or []:
+        if not isinstance(signal, dict):
+            continue
+        signal_type = str(signal.get("Type") or "").casefold()
+        localised = str(signal.get("Type_Localised") or "").casefold()
+        if "biological" not in signal_type and "biological" not in localised and "biologique" not in localised:
+            continue
+        raw_count = signal.get("Count", 0)
+        if isinstance(raw_count, (int, float)):
+            count += max(0, int(raw_count))
+    return count
 
 
 def _route_system(entry: Any) -> str | None:
@@ -576,6 +633,161 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
         super().__init__(plugin_manifest)
         self._helper: PluginHelper | None = None
         self._expedition_file: Path | None = None
+        self._last_announced_arrival: tuple[int, str] | None = None
+        self._reported_candidate_scans: set[tuple[int, str]] = set()
+        self._biological_signals: dict[tuple[int, str], int] = {}
+
+    def _language(self) -> str:
+        config = getattr(self._helper, "_config", {}) if self._helper else {}
+        if not isinstance(config, dict):
+            return "en"
+        model_name = str(config.get("tts_model_name") or "").strip().casefold()
+        if model_name.endswith(("-fr", "_fr")):
+            return "fr"
+        if model_name.endswith(("-en", "_en")):
+            return "en"
+        # The desktop launcher owns the shared speech-language selection and
+        # deliberately persists it to STT. tts_language can remain at its old
+        # default when a custom OpenAI-compatible TTS endpoint is selected.
+        value = str(config.get("stt_language") or config.get("tts_language") or "en")
+        return "fr" if value.casefold().startswith("fr") else "en"
+
+    def _active_expedition_target(self) -> tuple[int, dict[str, Any]] | None:
+        expedition = self._load_expedition()
+        if not expedition:
+            return None
+        targets = expedition.get("targets")
+        if not isinstance(targets, list):
+            return None
+        index = int(expedition.get("index", 0))
+        if index < 0 or index >= len(targets) or not isinstance(targets[index], dict):
+            return None
+        return index, targets[index]
+
+    def _speak(self, text: str, states: dict[str, Any]) -> None:
+        if self._helper is not None:
+            self._helper.speak_deterministic(text, states, context="exobiology_expedition")
+
+    def _announce_expedition_arrival(
+        self,
+        index: int,
+        target: dict[str, Any],
+        states: dict[str, Any],
+    ) -> None:
+        system = str(target.get("system") or "").strip()
+        arrival_key = (index, system.casefold())
+        if not system or self._last_announced_arrival == arrival_key:
+            return
+        bodies = _candidate_bodies_in_visit_order(target)
+        short_names = [_short_body_name(system, body) for body in bodies]
+        language = self._language()
+        rendered = _join_spoken(short_names, language)
+        if language == "fr":
+            text = (
+                f"Destination d’expédition atteinte : {system}. "
+                f"Au FSS, vérifie uniquement {rendered}. Je signalerai le First Footfall à chaque résolution."
+            )
+        else:
+            text = (
+                f"Expedition destination reached: {system}. "
+                f"In FSS, check only {rendered}. I will report First Footfall as each body resolves."
+            )
+        self._last_announced_arrival = arrival_key
+        self._speak(text, states)
+
+    def _report_candidate_scan(
+        self,
+        index: int,
+        target: dict[str, Any],
+        content: dict[str, Any],
+        states: dict[str, Any],
+    ) -> None:
+        body = str(content.get("BodyName") or "").strip()
+        if "WasFootfalled" not in content or not body:
+            return
+        candidate_keys = {
+            _body_key(name) for name in target.get("targeted_fss_bodies") or []
+        }
+        body_key = _body_key(body)
+        if body_key not in candidate_keys:
+            return
+        report_key = (index, body_key)
+        if report_key in self._reported_candidate_scans:
+            return
+
+        system = str(target.get("system") or "").strip()
+        label = _short_body_name(system, body)
+        bio_count = self._biological_signals.get(report_key, 0)
+        footfalled = content.get("WasFootfalled") is True
+        language = self._language()
+        if language == "fr":
+            if bio_count <= 0:
+                text = f"{label} : aucun signal biologique, skip."
+            elif footfalled:
+                text = (
+                    f"{label} : {bio_count} signal bio, First Footfall déjà pris. "
+                    "Dépriorise ; DSS seulement si BioInsights confirme Stratum."
+                )
+            else:
+                text = (
+                    f"{label} : {bio_count} signal bio, aucun First Footfall enregistré. "
+                    "DSS seulement si BioInsights confirme Stratum."
+                )
+        else:
+            if bio_count <= 0:
+                text = f"{label}: no biological signal; skip."
+            elif footfalled:
+                text = (
+                    f"{label}: {bio_count} biological signal, First Footfall already claimed. "
+                    "Deprioritize it; DSS only if BioInsights confirms Stratum."
+                )
+            else:
+                text = (
+                    f"{label}: {bio_count} biological signal, no First Footfall recorded. "
+                    "DSS only if BioInsights confirms Stratum."
+                )
+        self._reported_candidate_scans.add(report_key)
+        self._speak(text, states)
+
+    def _expedition_event_sideeffect(self, event: Event, states: dict[str, Any]) -> None:
+        if not isinstance(event, GameEvent):
+            return
+        active = self._active_expedition_target()
+        if active is None:
+            return
+        index, target = active
+        target_system = str(target.get("system") or "").strip()
+        event_name = event.content.get("event")
+
+        if event_name in {"FSDJump", "Location"}:
+            current_system = str(
+                event.content.get("StarSystem")
+                or _state(states, "Location").get("StarSystem")
+                or ""
+            ).strip()
+            if _systems_match(current_system, target_system):
+                self._announce_expedition_arrival(index, target, states)
+            elif event_name == "FSDJump":
+                self._last_announced_arrival = None
+            return
+
+        event_system = str(
+            event.content.get("StarSystem")
+            or _state(states, "Location").get("StarSystem")
+            or ""
+        ).strip()
+        if not _systems_match(event_system, target_system):
+            return
+
+        body = str(event.content.get("BodyName") or "").strip()
+        report_key = (index, _body_key(body))
+        candidate_keys = {
+            _body_key(name) for name in target.get("targeted_fss_bodies") or []
+        }
+        if event_name == "FSSBodySignals" and report_key[1] in candidate_keys:
+            self._biological_signals[report_key] = _biological_signal_count(event.content)
+        elif event_name == "Scan":
+            self._report_candidate_scan(index, target, event.content, states)
 
     def _configured_route_safety_policy(self) -> RouteSafetyPolicy | None:
         if self._helper is None:
@@ -843,6 +1055,7 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
     def on_chat_start(self, helper: PluginHelper):
         self._helper = helper
         self._expedition_file = Path(helper.get_plugin_data_path(self.plugin_manifest)) / "tectonicas-expedition.json"
+        helper.register_sideeffect(self._expedition_event_sideeffect)
         helper.register_status_generator(lambda _states: [("Authoritative Elite facts policy", {
             "rule": (
                 "Use lookup_elite_guide only for explanatory questions about Elite mechanics or facts. "

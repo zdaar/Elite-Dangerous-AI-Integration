@@ -10,6 +10,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from lib.Event import GameEvent
+
 # Keep this focused plugin test independent of COVAS audio/database imports.
 # Production imports these real modules; here only the type name and planner
 # call boundary are needed.
@@ -104,9 +106,12 @@ def make_plugin(tmp_path: Path):
         context.setdefault("NavInfo", {})["NavRoute"] = [{"StarSystem": args["system"]}]
         return f"Route to {args['system']} successfully plotted (Jumps: 3)"
 
+    spoken: list[str] = []
     plugin._helper = SimpleNamespace(
-        _action_manager=SimpleNamespace(actions={"plotToTarget": {"method": plot}})
+        _action_manager=SimpleNamespace(actions={"plotToTarget": {"method": plot}}),
+        speak_deterministic=lambda text, _states, **_kwargs: spoken.append(text),
     )
+    plugin._spoken = spoken
     return plugin, plotted
 
 
@@ -519,6 +524,103 @@ def test_route_brief_says_only_fuel_stars_when_every_hop_is_scoopable() -> None:
     assert brief["jumps"] == 1
     assert brief["fuel_stars_only"] is True
     assert brief["spoken_summary_fr"].endswith("Que des Fuel Stars.")
+
+
+def test_arrival_announces_fss_checklist_once_in_distance_order(tmp_path) -> None:
+    plugin, _plotted = make_plugin(tmp_path)
+    plugin._helper._config = {
+        "tts_language": "en",
+        "stt_language": "fr",
+        "tts_model_name": "chatterbox-fr",
+    }
+    queue = plugin_module._expedition_queue(clustered_plan())
+    queue[0]["targeted_fss_bodies"] = ["Cluster A 3", "Cluster A 2"]
+    queue[0]["candidate_bodies"] = [
+        {"body": "Cluster A 3", "distance_to_arrival_ls": 700.0},
+        {"body": "Cluster A 2", "distance_to_arrival_ls": 200.0},
+    ]
+    plugin._save_expedition({
+        "version": 3,
+        "queue_granularity": "system",
+        "strategy": "stratum_sniping",
+        "index": 0,
+        "targets": queue,
+    })
+    event = GameEvent(content={"event": "FSDJump", "StarSystem": "Cluster"}, historic=False)
+
+    plugin._expedition_event_sideeffect(event, {"Location": {"StarSystem": "Cluster"}})
+    plugin._expedition_event_sideeffect(event, {"Location": {"StarSystem": "Cluster"}})
+
+    assert len(plugin._spoken) == 1
+    assert "Destination d’expédition atteinte : Cluster" in plugin._spoken[0]
+    assert "A 2 et A 3" in plugin._spoken[0]
+
+
+def test_target_scan_reports_bio_and_claimed_footfall_once(tmp_path) -> None:
+    plugin, _plotted = make_plugin(tmp_path)
+    plugin._helper._config = {
+        "tts_language": "en",
+        "stt_language": "fr",
+        "tts_model_name": "chatterbox-fr",
+    }
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({
+        "version": 3,
+        "queue_granularity": "system",
+        "strategy": "stratum_sniping",
+        "index": 0,
+        "targets": queue,
+    })
+    states = {"Location": {"StarSystem": "Cluster"}}
+    signals = GameEvent(content={
+        "event": "FSSBodySignals",
+        "BodyName": "Cluster A 2",
+        "Signals": [{
+            "Type": "$SAA_SignalType_Biological;",
+            "Type_Localised": "Biological",
+            "Count": 1,
+        }],
+    }, historic=False)
+    scan = GameEvent(content={
+        "event": "Scan",
+        "StarSystem": "Cluster",
+        "BodyName": "Cluster A 2",
+        "WasFootfalled": True,
+    }, historic=False)
+
+    plugin._expedition_event_sideeffect(signals, states)
+    plugin._expedition_event_sideeffect(scan, states)
+    plugin._expedition_event_sideeffect(scan, states)
+
+    assert plugin._spoken == [
+        "A 2 : 1 signal bio, First Footfall déjà pris. Dépriorise ; DSS seulement si BioInsights confirme Stratum."
+    ]
+
+
+def test_target_scan_without_bio_is_immediate_skip(tmp_path) -> None:
+    plugin, _plotted = make_plugin(tmp_path)
+    plugin._helper._config = {
+        "tts_language": "en",
+        "stt_language": "fr",
+        "tts_model_name": "chatterbox-fr",
+    }
+    queue = plugin_module._expedition_queue(clustered_plan())
+    plugin._save_expedition({
+        "version": 3,
+        "queue_granularity": "system",
+        "strategy": "stratum_sniping",
+        "index": 0,
+        "targets": queue,
+    })
+
+    plugin._expedition_event_sideeffect(GameEvent(content={
+        "event": "Scan",
+        "StarSystem": "Cluster",
+        "BodyName": "Cluster A 3",
+        "WasFootfalled": False,
+    }, historic=False), {"Location": {"StarSystem": "Cluster"}})
+
+    assert plugin._spoken == ["A 3 : aucun signal biologique, skip."]
 
 
 def test_french_exploration_station_lookup_prefers_science_officer(tmp_path, monkeypatch) -> None:
