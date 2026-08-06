@@ -74,10 +74,11 @@ class ActionManager:
 
     _EXPLICIT_ADVANCE_PATTERNS = tuple(re.compile(pattern) for pattern in (
         r"^(?:nova\s+)?(?:operation\s+)?next(?:\s+(?:target|cible))?$",
+        r"^(?:nova\s+)?(?:expedition\s+next|next\s+system|systeme\s+suivant)$",
         r"^(?:nova\s+)?(?:skip|advance)$",
         r"\boperation\s+next\b",
-        r"\b(?:next target|prochaine cible|cible suivante)\b",
-        r"\b(?:advance|avance|skip|saute|abandonne)\b.{0,30}\b(?:target|cible|body|corps|queue|file)\b",
+        r"\b(?:next target|prochaine cible|cible suivante|next system|systeme suivant)\b",
+        r"\b(?:advance|avance|skip|saute|abandonne)\b.{0,30}\b(?:target|cible|body|corps|system|systeme|queue|file)\b",
         r"\b(?:nothing|rien)(?:\s+is)?\s+(?:here|ici)\b",
         r"\b(?:done|finished|complete|termine|fini)\s+(?:here|ici)\b",
     ))
@@ -96,6 +97,7 @@ class ActionManager:
         r"\b(?:where am i|ou suis je|systeme actuel|current system|cible actuelle|current target)\b",
         r"\b(?:statut|status)\b.{0,20}\b(?:route|navigation|expedition|file|queue|index)\b",
         r"\b(?:operation|index)\b.{0,20}\b(?:start|status|next|previous|reset|set|demarre|suivant|precedent)\b",
+        r"\b(?:expedition next|next system|systeme suivant)\b",
     ))
 
     @staticmethod

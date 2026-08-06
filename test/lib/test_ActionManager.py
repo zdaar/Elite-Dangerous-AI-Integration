@@ -207,6 +207,8 @@ def test_routing_guard_converts_accidental_next_to_status(utterance: str) -> Non
     [
         "Next.",
         "Nova, prochaine cible.",
+        "Nova, système suivant.",
+        "Expédition next.",
         "Rien ici. Opération next.",
         "Skip this target.",
     ],

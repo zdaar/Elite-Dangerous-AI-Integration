@@ -47,7 +47,7 @@ def test_exobiology_action_prompts_keep_direct_tool_scope() -> None:
 
     assert "Do not call web_search_agent, body_finder, or a guide lookup first or as a fallback" in actions
     assert "current route/queue status" in actions
-    assert "set selects the supplied one-based index" in plugin
+    assert "set selects the supplied one-based system index" in plugin
     assert "'guide me here', 'what now?', and current-body questions must not advance" in plugin
     assert '"distance_from_planning_source_ly"' in plugin
     assert '"route_destination"' in plugin

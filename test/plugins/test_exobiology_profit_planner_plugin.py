@@ -130,20 +130,17 @@ def test_find_action_delegates_all_strategies_and_arrival_cap_to_core(monkeypatc
     assert "Never run a full-system FSS" in result["next_action"]
 
 
-def test_expedition_queue_preserves_every_exact_body_in_cluster() -> None:
+def test_expedition_queue_groups_every_exact_body_by_system() -> None:
     queue = plugin_module._expedition_queue(clustered_plan())
 
-    assert [(item["system"], item["body"]) for item in queue] == [
-        ("Cluster", "Cluster A 2"),
-        ("Cluster", "Cluster A 3"),
-        ("Singleton", "Singleton 4"),
-    ]
+    assert [item["system"] for item in queue] == ["Cluster", "Singleton"]
     assert queue[0]["targeted_fss_bodies"] == ["Cluster A 2", "Cluster A 3"]
-    assert queue[1]["targeted_fss_bodies"] == ["Cluster A 2", "Cluster A 3"]
-    assert "do not scan the rest of the system" in queue[0]["instruction"]
+    assert queue[0]["candidate_count"] == 2
+    assert queue[1]["targeted_fss_bodies"] == ["Singleton 4"]
+    assert "operation next" in queue[0]["instruction"]
 
 
-def test_planning_persists_body_queue_and_plots_system_first(tmp_path, monkeypatch) -> None:
+def test_planning_persists_system_queue_and_plots_system_first(tmp_path, monkeypatch) -> None:
     plugin, plotted = make_plugin(tmp_path)
     captured = []
 
@@ -167,23 +164,21 @@ def test_planning_persists_body_queue_and_plots_system_first(tmp_path, monkeypat
         "max_results": 4,
         "max_arrival_ls": 1300,
     }
-    assert [(item["system"], item["body"]) for item in persisted["targets"]] == [
-        ("Cluster", "Cluster A 2"),
-        ("Cluster", "Cluster A 3"),
-        ("Singleton", "Singleton 4"),
-    ]
+    assert persisted["version"] == 3
+    assert persisted["queue_granularity"] == "system"
+    assert [item["system"] for item in persisted["targets"]] == ["Cluster", "Singleton"]
     assert plotted == [{"system": "Cluster"}]
-    assert result["body_queue_size"] == 3
+    assert result["system_queue_size"] == 2
     assert result["success"] is True
     assert result["route_verified"] is True
     assert result["targeted_fss_bodies"] == ["Cluster A 2", "Cluster A 3"]
     assert "First Footfall is a surface marker and pays no bonus" in result["warning"]
 
 
-def test_next_and_previous_select_exact_body_only_inside_target_system(tmp_path) -> None:
+def test_next_and_previous_move_exactly_one_system(tmp_path) -> None:
     plugin, plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
-    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+    plugin._save_expedition({"version": 3, "queue_granularity": "system", "strategy": "stratum_sniping", "index": 0, "targets": queue})
     context = {"Location": {"StarSystem": "Cluster"}}
 
     next_result = json.loads(plugin._control_expedition(
@@ -194,21 +189,20 @@ def test_next_and_previous_select_exact_body_only_inside_target_system(tmp_path)
     ))
 
     assert plotted == [
-        {"system": "Cluster", "body": "Cluster A 3"},
-        {"system": "Cluster", "body": "Cluster A 2"},
+        {"system": "Singleton"},
+        {"system": "Cluster"},
     ]
-    assert next_result["current_target"]["body"] == "Cluster A 3"
+    assert next_result["current_target"]["system"] == "Singleton"
     assert next_result["success"] is True
-    assert next_result["route_verified"] is False
-    assert next_result["navigation_verified"] is True
-    assert next_result["targeted_fss_bodies"] == ["Cluster A 2", "Cluster A 3"]
-    assert previous_result["current_target"]["body"] == "Cluster A 2"
+    assert next_result["route_verified"] is True
+    assert next_result["targeted_fss_bodies"] == ["Singleton 4"]
+    assert previous_result["current_target"]["system"] == "Cluster"
 
 
 def test_next_to_another_system_plots_system_not_remote_body(tmp_path) -> None:
     plugin, plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
-    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 1, "targets": queue})
+    plugin._save_expedition({"version": 3, "queue_granularity": "system", "strategy": "stratum_sniping", "index": 0, "targets": queue})
 
     result = json.loads(plugin._control_expedition(
         plugin_module.ExpeditionControlParameters(operation="next"),
@@ -216,7 +210,7 @@ def test_next_to_another_system_plots_system_not_remote_body(tmp_path) -> None:
     ))
 
     assert plotted == [{"system": "Singleton"}]
-    assert result["current_target"]["body"] == "Singleton 4"
+    assert result["current_target"]["system"] == "Singleton"
     assert result["plot_result"]["requested"] == {"system": "Singleton"}
     assert result["plot_result"]["status"] == "route_plotted"
 
@@ -224,46 +218,46 @@ def test_next_to_another_system_plots_system_not_remote_body(tmp_path) -> None:
 def test_set_uses_one_based_index_and_can_skip_plot(tmp_path) -> None:
     plugin, plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
-    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+    plugin._save_expedition({"version": 3, "queue_granularity": "system", "strategy": "stratum_sniping", "index": 0, "targets": queue})
 
     result = json.loads(plugin._control_expedition(
-        plugin_module.ExpeditionControlParameters(operation="set", index=3, plot=False),
+        plugin_module.ExpeditionControlParameters(operation="set", index=2, plot=False),
         {"Location": {"StarSystem": "Cluster"}},
     ))
     persisted = plugin._load_expedition()
 
     assert result["success"] is True
     assert result["queue_updated"] is True
-    assert result["queue_index"] == 3
-    assert result["queue_progress"] == "3/3"
-    assert result["current_target"]["body"] == "Singleton 4"
+    assert result["queue_index"] == 2
+    assert result["queue_progress"] == "2/2"
+    assert result["current_target"]["system"] == "Singleton"
     assert result["plot_requested"] is False
     assert result["route_verified"] is False
     assert result["navigation_state"] == "no_verified_route"
     assert result["plot_result"] is None
-    assert persisted["index"] == 2
+    assert persisted["index"] == 1
     assert plotted == []
 
 
 def test_set_rejects_missing_or_out_of_bounds_index_without_mutating_queue(tmp_path) -> None:
     plugin, plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
-    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 1, "targets": queue})
+    plugin._save_expedition({"version": 3, "queue_granularity": "system", "strategy": "stratum_sniping", "index": 1, "targets": queue})
 
     missing = json.loads(plugin._control_expedition(
         plugin_module.ExpeditionControlParameters(operation="set"),
         {"Location": {"StarSystem": "Cluster"}},
     ))
     out_of_bounds = json.loads(plugin._control_expedition(
-        plugin_module.ExpeditionControlParameters(operation="set", index=4),
+        plugin_module.ExpeditionControlParameters(operation="set", index=3),
         {"Location": {"StarSystem": "Cluster"}},
     ))
 
     assert missing["success"] is False
-    assert missing["valid_index_range"] == {"min": 1, "max": 3}
+    assert missing["valid_index_range"] == {"min": 1, "max": 2}
     assert out_of_bounds["success"] is False
-    assert out_of_bounds["requested_index"] == 4
-    assert out_of_bounds["valid_index_range"] == {"min": 1, "max": 3}
+    assert out_of_bounds["requested_index"] == 3
+    assert out_of_bounds["valid_index_range"] == {"min": 1, "max": 2}
     assert plugin._load_expedition()["index"] == 1
     assert plotted == []
 
@@ -271,7 +265,7 @@ def test_set_rejects_missing_or_out_of_bounds_index_without_mutating_queue(tmp_p
 def test_set_with_plot_reports_verified_result(tmp_path) -> None:
     plugin, plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
-    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+    plugin._save_expedition({"version": 3, "queue_granularity": "system", "strategy": "stratum_sniping", "index": 0, "targets": queue})
 
     result = json.loads(plugin._control_expedition(
         plugin_module.ExpeditionControlParameters(operation="set", index=2),
@@ -280,17 +274,17 @@ def test_set_with_plot_reports_verified_result(tmp_path) -> None:
 
     assert result["success"] is True
     assert result["queue_index"] == 2
-    assert result["route_verified"] is False
+    assert result["route_verified"] is True
     assert result["navigation_verified"] is True
-    assert result["navigation_state"] == "already_in_target_system"
-    assert result["plot_result"]["status"] == "body_selected"
-    assert plotted == [{"system": "Cluster", "body": "Cluster A 3"}]
+    assert result["navigation_state"] == "verified_route_to_target"
+    assert result["plot_result"]["status"] == "route_plotted"
+    assert plotted == [{"system": "Singleton"}]
 
 
 def test_failed_plot_is_not_reported_as_success_but_queue_position_is_saved(tmp_path) -> None:
     plugin, plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
-    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+    plugin._save_expedition({"version": 3, "queue_granularity": "system", "strategy": "stratum_sniping", "index": 0, "targets": queue})
 
     def failed_plot(args, _context):
         plotted.append(args)
@@ -298,16 +292,16 @@ def test_failed_plot_is_not_reported_as_success_but_queue_position_is_saved(tmp_
 
     plugin._helper._action_manager.actions["plotToTarget"]["method"] = failed_plot
     result = json.loads(plugin._control_expedition(
-        plugin_module.ExpeditionControlParameters(operation="set", index=3),
+        plugin_module.ExpeditionControlParameters(operation="set", index=2),
         {"Location": {"StarSystem": "Cluster"}},
     ))
 
     assert result["success"] is False
     assert result["queue_updated"] is True
-    assert result["queue_index"] == 3
+    assert result["queue_index"] == 2
     assert result["route_verified"] is False
     assert result["plot_result"]["status"] == "plot_failed"
-    assert plugin._load_expedition()["index"] == 2
+    assert plugin._load_expedition()["index"] == 1
 
 
 def test_body_lookup_without_selection_is_not_navigation_success() -> None:
@@ -329,7 +323,7 @@ def test_body_lookup_without_selection_is_not_navigation_success() -> None:
 def test_status_and_queue_only_set_surface_live_route_mismatch(tmp_path) -> None:
     plugin, plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
-    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 0, "targets": queue})
+    plugin._save_expedition({"version": 3, "queue_granularity": "system", "strategy": "stratum_sniping", "index": 0, "targets": queue})
     context = {
         "Location": {"StarSystem": "Start"},
         "NavInfo": {
@@ -342,7 +336,7 @@ def test_status_and_queue_only_set_surface_live_route_mismatch(tmp_path) -> None
         plugin_module.ExpeditionControlParameters(operation="status"), context
     ))
     selected = json.loads(plugin._control_expedition(
-        plugin_module.ExpeditionControlParameters(operation="set", index=3, plot=False), context
+        plugin_module.ExpeditionControlParameters(operation="set", index=2, plot=False), context
     ))
 
     assert status["plot_requested"] is False
@@ -359,10 +353,11 @@ def test_status_context_separates_queue_target_route_hops_and_planning_distance(
     plugin, _plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
     plugin._save_expedition({
-        "version": 2,
+        "version": 3,
+        "queue_granularity": "system",
         "strategy": "stratum_sniping",
         "source_system": "Start",
-        "index": 2,
+        "index": 1,
         "targets": queue,
     })
 
@@ -378,24 +373,24 @@ def test_status_context_separates_queue_target_route_hops_and_planning_distance(
     })[0]
 
     assert title == "Active exobiology expedition"
-    assert status["queue_index"] == 3
-    assert status["queue_progress"] == "3/3"
+    assert status["queue_index"] == 2
+    assert status["queue_progress"] == "2/2"
     assert status["planning_source_system"] == "Start"
     assert status["target_system"] == "Singleton"
-    assert status["target_body"] == "Singleton 4"
+    assert status["targeted_fss_bodies"] == ["Singleton 4"]
     assert status["distance_from_planning_source_ly"] == 55.0
     assert status["navigation_state"] == "verified_route_to_target"
     assert status["route_next_hop"] == "Transit"
     assert status["route_destination"] == "Singleton"
     assert status["remaining_jumps"] == 2
     assert status["next_jump_target"] == "Transit"
-    assert "one-based index" in status["control"]
+    assert "one-based system index" in status["control"]
 
 
 def test_status_context_calls_out_route_target_mismatch(tmp_path) -> None:
     plugin, _plotted = make_plugin(tmp_path)
     queue = plugin_module._expedition_queue(clustered_plan())
-    plugin._save_expedition({"version": 2, "strategy": "stratum_sniping", "index": 2, "targets": queue})
+    plugin._save_expedition({"version": 3, "queue_granularity": "system", "strategy": "stratum_sniping", "index": 1, "targets": queue})
 
     _title, status = plugin._expedition_status({
         "Location": {"StarSystem": "Cluster"},
@@ -408,6 +403,90 @@ def test_status_context_calls_out_route_target_mismatch(tmp_path) -> None:
     assert status["target_system"] == "Singleton"
     assert status["route_destination"] == "Wrong Destination"
     assert status["navigation_state"] == "route_target_mismatch"
+
+
+def test_legacy_body_queue_migrates_to_active_system_without_losing_candidates(tmp_path) -> None:
+    plugin, _plotted = make_plugin(tmp_path)
+    legacy_targets = [
+        {
+            "system": "Cluster",
+            "body": "Cluster A 2",
+            "targeted_fss_bodies": ["Cluster A 2", "Cluster A 3"],
+            "distance_to_arrival_ls": 200.0,
+        },
+        {
+            "system": "Cluster",
+            "body": "Cluster A 3",
+            "targeted_fss_bodies": ["Cluster A 2", "Cluster A 3"],
+            "distance_to_arrival_ls": 700.0,
+        },
+        {
+            "system": "Singleton",
+            "body": "Singleton 4",
+            "targeted_fss_bodies": ["Singleton 4"],
+        },
+    ]
+    plugin._save_expedition({
+        "version": 2,
+        "strategy": "stratum_sniping",
+        "index": 1,
+        "targets": legacy_targets,
+    })
+
+    migrated = plugin._load_expedition()
+
+    assert migrated["version"] == 3
+    assert migrated["queue_granularity"] == "system"
+    assert migrated["index"] == 0
+    assert [target["system"] for target in migrated["targets"]] == ["Cluster", "Singleton"]
+    assert migrated["targets"][0]["targeted_fss_bodies"] == ["Cluster A 2", "Cluster A 3"]
+
+
+def test_route_brief_reports_live_distance_jumps_and_non_fuel_arrival() -> None:
+    brief = plugin_module._route_brief(
+        {"system": "Destination", "targeted_fss_bodies": ["Destination A 2"]},
+        {
+            "Location": {"StarSystem": "Start", "StarPos": [0.0, 0.0, 0.0]},
+            "NavInfo": {
+                "NavRoute": [
+                    {"StarSystem": "Fuel Stop", "StarPos": [3.0, 4.0, 0.0], "StarClass": "K", "Scoopable": True},
+                    {"StarSystem": "Destination", "StarPos": [3.0, 4.0, 12.0], "StarClass": "L", "Scoopable": False},
+                ]
+            },
+        },
+    )
+
+    assert brief["verified"] is True
+    assert brief["destination_system"] == "Destination"
+    assert brief["total_distance_ly"] == 17.0
+    assert brief["jumps"] == 2
+    assert brief["fuel_stars_only"] is False
+    assert brief["non_fuel_stars"] == [{
+        "hop": 2,
+        "system": "Destination",
+        "star_class": "L",
+        "fuel_star": False,
+    }]
+    assert "À l’arrivée : étoile de classe L, non scoopable." in brief["spoken_summary_fr"]
+
+
+def test_route_brief_says_only_fuel_stars_when_every_hop_is_scoopable() -> None:
+    brief = plugin_module._route_brief(
+        {"system": "Destination"},
+        {
+            "Location": {"StarSystem": "Start", "StarPos": [0.0, 0.0, 0.0]},
+            "NavInfo": {
+                "NavRoute": [
+                    {"StarSystem": "Destination", "StarPos": [10.0, 0.0, 0.0], "StarClass": "F", "Scoopable": True},
+                ]
+            },
+        },
+    )
+
+    assert brief["total_distance_ly"] == 10.0
+    assert brief["jumps"] == 1
+    assert brief["fuel_stars_only"] is True
+    assert brief["spoken_summary_fr"].endswith("Que des Fuel Stars.")
 
 
 def test_french_exploration_station_lookup_prefers_science_officer(tmp_path, monkeypatch) -> None:

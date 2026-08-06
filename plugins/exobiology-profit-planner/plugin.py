@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import time
@@ -104,6 +105,111 @@ def _route_system(entry: Any) -> str | None:
     value = item.get("StarSystem") or item.get("star_system")
     text = str(value or "").strip()
     return text or None
+
+
+FUEL_STAR_CLASSES = frozenset({"K", "G", "B", "F", "O", "A", "M"})
+
+
+def _star_position(value: Any) -> tuple[float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    if any(not isinstance(coordinate, (int, float)) for coordinate in value):
+        return None
+    return float(value[0]), float(value[1]), float(value[2])
+
+
+def _route_brief(target: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    """Build a deterministic, ready-to-read summary from the live plotted route."""
+    target_system = str(target.get("system") or "").strip()
+    navigation = _navigation_truth(target, context)
+    nav_info = _state(context, "NavInfo")
+    raw_route = nav_info.get("NavRoute") or []
+    route = [_as_dict(entry) for entry in raw_route] if isinstance(raw_route, list) else []
+
+    total_distance_ly: float | None = None
+    previous_position = _star_position(_state(context, "Location").get("StarPos"))
+    if route and previous_position is not None:
+        accumulated_distance = 0.0
+        for entry in route:
+            position = _star_position(entry.get("StarPos"))
+            if position is None:
+                break
+            accumulated_distance += math.dist(previous_position, position)
+            previous_position = position
+        else:
+            total_distance_ly = round(accumulated_distance, 2)
+
+    route_stars: list[dict[str, Any]] = []
+    for hop, entry in enumerate(route, start=1):
+        star_class = str(entry.get("StarClass") or "").strip().upper() or None
+        raw_scoopable = entry.get("Scoopable")
+        scoopable = raw_scoopable if isinstance(raw_scoopable, bool) else (
+            star_class in FUEL_STAR_CLASSES if star_class else None
+        )
+        route_stars.append({
+            "hop": hop,
+            "system": _route_system(entry),
+            "star_class": star_class,
+            "fuel_star": scoopable,
+        })
+
+    non_fuel_stars = [star for star in route_stars if star["fuel_star"] is False]
+    unknown_stars = [star for star in route_stars if star["fuel_star"] is None]
+    arrival_star = route_stars[-1] if route_stars else None
+    verified = bool(navigation["route_verified"] or navigation["target_reached"])
+
+    if not verified:
+        spoken_summary_fr = (
+            f"Prochain système : {target_system}. Route non vérifiée ; ne saute pas encore."
+        )
+    elif navigation["target_reached"]:
+        spoken_summary_fr = (
+            f"Système atteint : {target_system}. Corps candidats : "
+            f"{', '.join(target.get('targeted_fss_bodies') or []) or 'aucun'}."
+        )
+    else:
+        distance_text = (
+            f"{total_distance_ly:.2f} années-lumière"
+            if total_distance_ly is not None
+            else "distance totale indisponible"
+        )
+        jumps = len(route)
+        jump_text = f"{jumps} saut" if jumps == 1 else f"{jumps} sauts"
+        parts = [f"Prochain système : {target_system}. Distance totale : {distance_text}. {jump_text}."]
+        if route_stars and not non_fuel_stars and not unknown_stars:
+            parts.append("Que des Fuel Stars.")
+        else:
+            if non_fuel_stars:
+                rendered = ", ".join(
+                    f"saut {star['hop']} {star['system']}, classe {star['star_class'] or 'inconnue'}"
+                    for star in non_fuel_stars
+                )
+                parts.append(f"Étoiles non-Fuel sur la route : {rendered}.")
+            if unknown_stars:
+                rendered = ", ".join(
+                    f"saut {star['hop']} {star['system']}"
+                    for star in unknown_stars
+                )
+                parts.append(f"Classe stellaire inconnue : {rendered}.")
+        if arrival_star and arrival_star["fuel_star"] is not True:
+            fuel_text = "non scoopable" if arrival_star["fuel_star"] is False else "scoopabilité inconnue"
+            parts.append(
+                f"À l’arrivée : étoile de classe {arrival_star['star_class'] or 'inconnue'}, {fuel_text}."
+            )
+        spoken_summary_fr = " ".join(parts)
+
+    return {
+        "verified": verified,
+        "destination_system": target_system,
+        "total_distance_ly": total_distance_ly,
+        "jumps": len(route),
+        "fuel_stars_only": bool(route_stars and not non_fuel_stars and not unknown_stars),
+        "non_fuel_stars": non_fuel_stars,
+        "unknown_stars": unknown_stars,
+        "arrival_star": arrival_star,
+        "spoken_summary_fr": spoken_summary_fr,
+        "response_contract": "Read spoken_summary_fr verbatim. Add nothing else.",
+    }
 
 
 def _navigation_truth(target: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
@@ -229,6 +335,7 @@ def _plot_result_payload(
         "navigation_state": navigation["navigation_state"],
         "route_next_hop": navigation["route_next_hop"],
         "remaining_jumps": navigation["remaining_jumps"],
+        "route_brief": _route_brief(target, context),
         "result": result_text,
     }
 
@@ -246,7 +353,7 @@ def _plan(parameters: PlannerParameters, context: dict[str, Any]) -> str:
 
 
 def _expedition_queue(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Flatten clustered system results without dropping any candidate body."""
+    """Build one queue entry per system while preserving every candidate body."""
     queue: list[dict[str, Any]] = []
     for system_index, system_target in enumerate(plan.get("targets") or [], start=1):
         system = str(system_target.get("system") or "").strip()
@@ -260,36 +367,108 @@ def _expedition_queue(plan: dict[str, Any]) -> list[dict[str, Any]]:
         ]
         if not system or not body_names:
             continue
-        for body_index, body in enumerate(bodies, start=1):
-            body_name = str(body.get("body") or "").strip()
-            if not body_name:
-                continue
-            queue.append({
-                "system": system,
-                "body": body_name,
-                "system_queue_position": system_index,
-                "body_queue_position": body_index,
-                "body_count_in_system": len(body_names),
-                "targeted_fss_bodies": body_names,
-                "distance_to_arrival_ls": body.get("distance_to_arrival_ls"),
-                "atmosphere": body.get("atmosphere"),
-                "gravity_g": body.get("gravity_g"),
-                "surface_temperature_k": body.get("surface_temperature_k"),
-                "updated_at": body.get("updated_at"),
-                "distance_ly": system_target.get("distance_ly"),
-                "distance_from_planning_source_ly": system_target.get("distance_ly"),
-                "distance_from_sol_ly": system_target.get("distance_from_sol_ly"),
-                "estimated_jumps": system_target.get("estimated_jumps"),
-                "route_order": system_target.get("route_order"),
-                "confidence_tier": system_target.get("confidence_tier"),
-                "confidence": system_target.get("confidence"),
-                "instruction": (
-                    f"In {system}, select {body_name} directly if it is exposed. Otherwise resolve only these HMC bodies in FSS: "
-                    f"{', '.join(body_names)}. Stop after the listed bodies; do not scan the rest of the system. "
-                    "Check BioInsights, then DSS only if Stratum is predicted."
-                ),
-            })
+        queue.append({
+            "system": system,
+            "system_queue_position": system_index,
+            "candidate_count": len(body_names),
+            "targeted_fss_bodies": body_names,
+            "candidate_bodies": [
+                {
+                    "body": str(body.get("body") or "").strip(),
+                    "distance_to_arrival_ls": body.get("distance_to_arrival_ls"),
+                    "atmosphere": body.get("atmosphere"),
+                    "gravity_g": body.get("gravity_g"),
+                    "surface_temperature_k": body.get("surface_temperature_k"),
+                    "updated_at": body.get("updated_at"),
+                }
+                for body in bodies
+                if str(body.get("body") or "").strip()
+            ],
+            "distance_ly": system_target.get("distance_ly"),
+            "distance_from_planning_source_ly": system_target.get("distance_ly"),
+            "distance_from_sol_ly": system_target.get("distance_from_sol_ly"),
+            "estimated_jumps": system_target.get("estimated_jumps"),
+            "route_order": system_target.get("route_order"),
+            "confidence_tier": system_target.get("confidence_tier"),
+            "confidence": system_target.get("confidence"),
+            "instruction": (
+                f"Dans {system}, vérifie uniquement ces {len(body_names)} corps candidats : {', '.join(body_names)}. "
+                "Quand le système est terminé, operation next passe directement au système suivant."
+            ),
+        })
     return queue
+
+
+def _migrate_expedition_to_system_queue(expedition: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Collapse legacy v2 body entries into v3 system entries."""
+    if expedition.get("version") == 3 and expedition.get("queue_granularity") == "system":
+        return expedition, False
+
+    legacy_targets = expedition.get("targets") or []
+    if not isinstance(legacy_targets, list):
+        return expedition, False
+    legacy_index = int(expedition.get("index", 0))
+    if legacy_index >= len(legacy_targets):
+        active_system = None
+    else:
+        active_system = str(_as_dict(legacy_targets[max(0, legacy_index)]).get("system") or "").strip()
+
+    grouped: list[dict[str, Any]] = []
+    by_system: dict[str, dict[str, Any]] = {}
+    for raw_target in legacy_targets:
+        target = _as_dict(raw_target)
+        system = str(target.get("system") or "").strip()
+        if not system:
+            continue
+        key = system.casefold()
+        if key not in by_system:
+            base = dict(target)
+            base.pop("body", None)
+            base.pop("body_queue_position", None)
+            base.pop("body_count_in_system", None)
+            base["system_queue_position"] = len(grouped) + 1
+            base["targeted_fss_bodies"] = []
+            base["candidate_bodies"] = []
+            by_system[key] = base
+            grouped.append(base)
+        grouped_target = by_system[key]
+        names = list(target.get("targeted_fss_bodies") or [])
+        body_name = str(target.get("body") or "").strip()
+        if body_name:
+            names.append(body_name)
+            grouped_target["candidate_bodies"].append({
+                "body": body_name,
+                "distance_to_arrival_ls": target.get("distance_to_arrival_ls"),
+                "atmosphere": target.get("atmosphere"),
+                "gravity_g": target.get("gravity_g"),
+                "surface_temperature_k": target.get("surface_temperature_k"),
+                "updated_at": target.get("updated_at"),
+            })
+        for name in names:
+            clean_name = str(name or "").strip()
+            if clean_name and clean_name not in grouped_target["targeted_fss_bodies"]:
+                grouped_target["targeted_fss_bodies"].append(clean_name)
+
+    for target in grouped:
+        bodies = target["targeted_fss_bodies"]
+        target["candidate_count"] = len(bodies)
+        target["instruction"] = (
+            f"Dans {target['system']}, vérifie uniquement ces {len(bodies)} corps candidats : {', '.join(bodies)}. "
+            "Quand le système est terminé, operation next passe directement au système suivant."
+        )
+
+    migrated_index = len(grouped)
+    if active_system:
+        migrated_index = next(
+            (index for index, target in enumerate(grouped) if _systems_match(target.get("system"), active_system)),
+            len(grouped),
+        )
+    expedition["version"] = 3
+    expedition["queue_granularity"] = "system"
+    expedition["targets"] = grouped
+    expedition["index"] = migrated_index
+    expedition["system_count"] = len(grouped)
+    return expedition, True
 
 
 def _field_guide(parameters: FieldGuideParameters, _context: dict[str, Any]) -> str:
@@ -394,7 +573,11 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
         if self._expedition_file is None or not self._expedition_file.exists():
             return None
         try:
-            return json.loads(self._expedition_file.read_text(encoding="utf-8"))
+            expedition = json.loads(self._expedition_file.read_text(encoding="utf-8"))
+            expedition, migrated = _migrate_expedition_to_system_queue(expedition)
+            if migrated:
+                self._save_expedition(expedition)
+            return expedition
         except (OSError, ValueError):
             return None
 
@@ -409,19 +592,9 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
         descriptor = self._helper._action_manager.actions.get("plotToTarget")
         if not descriptor:
             raise RuntimeError("plotToTarget is unavailable or disabled")
+        # Expeditions navigate only between systems. Candidate bodies are a
+        # read-only checklist and never become plot targets.
         plot_args = {"system": target["system"]}
-        current_system = str(
-            _state(context, "Location").get("StarSystem")
-            or _state(context, "Location").get("star_system")
-            or ""
-        ).strip()
-        target_system = str(target.get("system") or "").strip()
-        body = str(target.get("body") or "").strip()
-        if body and current_system.casefold() == target_system.casefold():
-            # The built-in plotter safely gates in-system body selection on its
-            # navigation capability. Outside the target system, plotting the
-            # system alone avoids trying to select an unreachable body.
-            plot_args["body"] = body
         try:
             result = descriptor["method"](plot_args, context)
         except Exception as error:
@@ -445,7 +618,6 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             "planning_source_system": expedition.get("source_system"),
             "current_system": current_system,
             "target_system": target_system,
-            "target_body": current.get("body") if current else None,
             "distance_from_planning_source_ly": (
                 current.get("distance_from_planning_source_ly", current.get("distance_ly")) if current else None
             ),
@@ -457,6 +629,7 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             "route_destination": navigation["route_destination"],
             "remaining_jumps": navigation["remaining_jumps"],
             "next_jump_target": navigation["next_jump_target"],
+            "route_brief": _route_brief(current or {}, states),
             "instruction": current.get("instruction") if current else "Queue complete.",
             "distance_rule": (
                 "The stored distance is from the planning source, not the ship's current distance. "
@@ -467,8 +640,8 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
                 "Do not call a route successful when navigation_state is route_target_mismatch or no_verified_route."
             ),
             "control": (
-                "Use control_exobiology_expedition: status reads; start replots without advancing; next/previous move one; "
-                "set selects a one-based index; reset only on explicit request. Set plot=false for queue-only changes."
+                "The queue is system-level. status reads; start replots without advancing; next/previous move exactly one system; "
+                "set selects a one-based system index; reset only on explicit request. Set plot=false for queue-only changes."
             ),
         })]
 
@@ -491,7 +664,8 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
                 "search_center_coords": plan.get("search_center_coords"),
             }, ensure_ascii=False)
         expedition = {
-            "version": 2,
+            "version": 3,
+            "queue_granularity": "system",
             "strategy": "stratum_sniping",
             "source_system": plan.get("source_system"),
             "source_coords": plan.get("source_coords"),
@@ -514,14 +688,15 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             "navigation_state": plot_result["navigation_state"],
             "strategy": expedition["strategy"],
             "systems": expedition["system_count"],
-            "body_queue_size": len(queue),
+            "system_queue_size": len(queue),
             "current_target": queue[0],
             "targeted_fss_bodies": queue[0]["targeted_fss_bodies"],
             "plot_result": plot_result,
+            "route_brief": plot_result["route_brief"],
             "instruction": queue[0]["instruction"],
             "control": (
-                "Say prochaine cible / next target to advance one exact body; use operation=set with a one-based index "
-                "to select an explicit queue position."
+                "Say système suivant / expedition next after checking the listed candidates to advance exactly one system. "
+                "Use operation=set with a one-based system index to select an explicit system."
             ),
             "warning": (
                 "First Footfall is a surface marker and pays no bonus. The 5x bonus requires First Logged when the data is first sold. "
@@ -612,6 +787,9 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             "route_next_hop": navigation["route_next_hop"],
             "route_destination": navigation["route_destination"],
             "remaining_jumps": navigation["remaining_jumps"],
+            "route_brief": (
+                plot_result["route_brief"] if plot_result is not None else _route_brief(target, context)
+            ),
             "plot_result": plot_result,
         }, ensure_ascii=False)
 
@@ -699,10 +877,10 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
             helper.register_action(
                 name="plan_tectonicas_expedition",
                 description=(
-                    "Immediately build and persist an efficient fixed queue from pre-Odyssey HMC Stratum leads when the commander asks Nova to "
-                    "create a new managed expedition and plot targets one by one. Do not use it merely to inspect, resume, or change an existing "
+                    "Immediately build and persist an efficient system-level queue from pre-Odyssey HMC Stratum leads when the commander asks Nova to "
+                    "create a new managed expedition. Do not use it merely to inspect, resume, or change an existing "
                     "queue; use control_exobiology_expedition for that. Do not perform a guide lookup or web search first. Keep every exact candidate body in "
-                    "clustered systems, then plot the first system. At each system, select exposed bodies directly or resolve only the listed HMC "
+                    "one checklist per system, then plot the first system. At each system, select exposed bodies directly or resolve only the listed HMC "
                     "bodies in FSS; never instruct a full-system scan. These are stale-record leads, not guarantees of Stratum, First Footfall, "
                     "or First Logged. First Footfall pays no bonus; First Logged is determined when biodata is first sold."
                 ),
@@ -716,10 +894,10 @@ class ExobiologyProfitPlannerPlugin(PluginBase):
                 name="control_exobiology_expedition",
                 description=(
                     "Control the persistent exobiology expedition without a preliminary lookup or search. status reads without mutation; start "
-                    "replots the current target; next/previous move one body; set selects the supplied one-based index; reset requires an explicit "
-                    "reset request. Use plot=false for a queue-only set. Call next only for 'prochaine cible'/'next target' or explicit completion/skip; "
-                    "'guide me here', 'what now?', and current-body questions must not advance. The result separates queue_updated from verified plot "
-                    "success; report any requested-target/route-destination mismatch and never tell the commander to jump on a mismatch."
+                    "replots the current system; next/previous move exactly one whole system; set selects the supplied one-based system index; reset requires an explicit "
+                    "reset request. Use plot=false for a queue-only set. Call next only for 'système suivant', 'expedition next', or explicit system completion/skip; "
+                    "'guide me here', 'what now?', and current-body questions must not advance. The candidate bodies are a checklist, never separate queue entries. "
+                    "After plotting, read route_brief.spoken_summary_fr verbatim and add nothing else. Never tell the commander to jump on an unverified route."
                 ),
                 parameters=ExpeditionControlParameters,
                 method=self._control_expedition,
